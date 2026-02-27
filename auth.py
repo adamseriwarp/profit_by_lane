@@ -2,12 +2,15 @@ import streamlit as st
 
 def check_password():
     """Returns `True` if the user has entered the correct password."""
-    
+
     def password_entered():
         """Checks whether a password entered by the user is correct."""
-        if st.session_state["password"] == st.secrets.get("APP_PASSWORD", ""):
+        # Use .get() to safely access the password key (may not exist on page refresh)
+        password = st.session_state.get("password", "")
+        if password == st.secrets.get("APP_PASSWORD", ""):
             st.session_state["password_correct"] = True
-            del st.session_state["password"]  # Don't store password
+            if "password" in st.session_state:
+                del st.session_state["password"]  # Don't store password
         else:
             st.session_state["password_correct"] = False
 

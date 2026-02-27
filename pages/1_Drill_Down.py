@@ -311,8 +311,9 @@ def get_order_summary_metrics(start_date, end_date, drill_type, selected_value, 
         END
     """
 
+    # Include canceled orders with crossdock legs
     base_conditions = [
-        "shipmentStatus != 'removed'",
+        "(shipmentStatus = 'Complete' OR (shipmentStatus = 'canceled' AND pickLocationName = dropLocationName))",
         f"({date_field}) >= '{start_date}'",
         f"({date_field}) <= '{end_date}'"
     ]
@@ -335,29 +336,39 @@ def get_order_summary_metrics(start_date, end_date, drill_type, selected_value, 
 
     base_where = " AND ".join(base_conditions)
 
-    # Use separate Revenue and Cost Smart Strategies (same as Summary_View.py)
+    # Use separate Revenue and Cost Smart Strategies
+    # For canceled orders: only use crossdock leg revenue/cost
     query = f"""
     WITH order_metrics AS (
         SELECT
             orderCode,
-            -- Revenue metrics
-            SUM(CASE WHEN mainShipment = 'YES' AND shipmentStatus != 'removed' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as yes_rev,
-            SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus != 'removed' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as no_rev,
-            SUM(CASE WHEN mainShipment = 'NO' AND pickLocationName = dropLocationName AND shipmentStatus != 'removed'
+            MAX(CASE WHEN mainShipment = 'YES' THEN shipmentStatus END) as order_status,
+            -- Revenue metrics (for Complete orders only)
+            SUM(CASE WHEN mainShipment = 'YES' AND shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as yes_rev,
+            SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as no_rev,
+            SUM(CASE WHEN mainShipment = 'NO' AND pickLocationName = dropLocationName AND shipmentStatus = 'Complete'
                 THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as xd_leg_rev,
-            -- Cost metrics
-            SUM(CASE WHEN mainShipment = 'YES' AND shipmentStatus != 'removed' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as yes_cost,
-            SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus != 'removed' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as no_cost,
-            SUM(CASE WHEN mainShipment = 'NO' AND pickLocationName = dropLocationName AND shipmentStatus != 'removed'
+            -- Cost metrics (for Complete orders only)
+            SUM(CASE WHEN mainShipment = 'YES' AND shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as yes_cost,
+            SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as no_cost,
+            SUM(CASE WHEN mainShipment = 'NO' AND pickLocationName = dropLocationName AND shipmentStatus = 'Complete'
                 THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as xd_no_cost,
+            -- Canceled order crossdock values
+            SUM(CASE WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName
+                THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as canceled_xd_rev,
+            SUM(CASE WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName
+                THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as canceled_xd_cost,
+            -- TONU metrics (Truck Order Not Used)
+            SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_revenue,
+            SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost,
             -- Duplicate detection for cost
-            MAX(CASE WHEN mainShipment = 'NO' AND shipmentStatus != 'removed' AND ABS(
+            MAX(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete' AND ABS(
                 COALESCE(costAllocationNumber, 0) - (
                     SELECT SUM(COALESCE(costAllocationNumber, 0))
                     FROM otp_reports o2
                     WHERE o2.orderCode = otp_reports.orderCode
                       AND o2.mainShipment = 'YES'
-                      AND o2.shipmentStatus != 'removed'
+                      AND o2.shipmentStatus = 'Complete'
                 )
             ) < 1 THEN 1 ELSE 0 END) as has_matching_no_row
         FROM otp_reports
@@ -367,35 +378,40 @@ def get_order_summary_metrics(start_date, end_date, drill_type, selected_value, 
     order_calculated AS (
         SELECT
             orderCode,
-            -- Revenue Smart Strategy
+            order_status,
+            -- Revenue: Smart Strategy for Complete, XD only for canceled
             CASE
+                WHEN order_status = 'canceled' THEN canceled_xd_rev
                 WHEN yes_rev > 0 AND no_rev = 0 THEN yes_rev
                 WHEN yes_rev = 0 THEN no_rev
                 WHEN ABS((no_rev - xd_leg_rev) - yes_rev) < 1 THEN no_rev
                 WHEN yes_rev > 2 * no_rev THEN yes_rev + no_rev
                 ELSE no_rev
             END as smart_revenue,
-            -- Cost Smart Strategy (V3 with sub-strategy)
+            -- Cost: Smart Strategy for Complete, XD only for canceled
             CASE
+                WHEN order_status = 'canceled' THEN canceled_xd_cost
                 WHEN yes_cost > 0 AND no_cost = 0 THEN yes_cost
                 WHEN yes_cost = 0 AND no_cost > 0 THEN no_cost
                 WHEN ABS((no_cost - xd_no_cost) - yes_cost) < 20 THEN
-                    CASE
-                        WHEN has_matching_no_row = 1 THEN yes_cost
-                        ELSE yes_cost + no_cost
-                    END
+                    CASE WHEN has_matching_no_row = 1 THEN yes_cost ELSE yes_cost + no_cost END
                 WHEN no_cost > yes_cost * 5 THEN yes_cost + no_cost
                 ELSE yes_cost + xd_no_cost
             END as smart_cost,
-            xd_no_cost as crossdock_cost
+            CASE WHEN order_status = 'canceled' THEN canceled_xd_cost ELSE xd_no_cost END as crossdock_cost,
+            tonu_revenue,
+            tonu_cost
         FROM order_metrics
     )
     SELECT
-        COUNT(DISTINCT orderCode) as order_count,
+        COUNT(DISTINCT CASE WHEN order_status = 'Complete' THEN orderCode END) as completed_orders,
+        COUNT(DISTINCT CASE WHEN order_status = 'canceled' THEN orderCode END) as canceled_orders,
         SUM(smart_revenue) as total_revenue,
         SUM(smart_cost) as total_cost,
         SUM(smart_revenue) - SUM(smart_cost) as total_profit,
-        SUM(crossdock_cost) as crossdock_cost
+        SUM(crossdock_cost) as crossdock_cost,
+        SUM(tonu_revenue) as tonu_revenue,
+        SUM(tonu_cost) as tonu_cost
     FROM order_calculated
     """
 
@@ -428,29 +444,44 @@ if selected_value:
 
         # Extract summary values (use Smart Strategy totals, but row count from df)
         if summary_df is not None and len(summary_df) > 0:
-            total_orders = int(summary_df['order_count'].iloc[0])
+            completed_orders = int(summary_df['completed_orders'].iloc[0])
+            canceled_orders = int(summary_df['canceled_orders'].iloc[0])
             total_revenue = float(summary_df['total_revenue'].iloc[0])
             total_cost = float(summary_df['total_cost'].iloc[0])
             total_profit = float(summary_df['total_profit'].iloc[0])
             crossdock_cost = float(summary_df['crossdock_cost'].iloc[0])
+            tonu_revenue = float(summary_df['tonu_revenue'].iloc[0]) if 'tonu_revenue' in summary_df.columns else 0
+            tonu_cost = float(summary_df['tonu_cost'].iloc[0]) if 'tonu_cost' in summary_df.columns else 0
         else:
             # Fallback to raw row sums if summary query fails
-            total_orders = df['Order ID'].nunique()
+            completed_orders = df['Order ID'].nunique()
+            canceled_orders = 0
             total_revenue = df['Revenue'].sum()
             total_cost = df['Cost'].sum()
             total_profit = df['Profit'].sum()
             crossdock_df = df[df['Cross-dock'] == 'Yes']
             crossdock_cost = crossdock_df['Cost'].sum()
+            tonu_revenue = 0
+            tonu_cost = 0
 
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Total Orders", f"{total_orders:,}")
-        col2.metric("Total Rows", f"{len(df):,}")
-        col3.metric("Total Revenue", f"${total_revenue:,.0f}")
-        col4.metric("Total Cost", f"${total_cost:,.0f}")
-        col5.metric("Total Profit", f"${total_profit:,.0f}")
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
+        col1.metric("Completed Orders", f"{completed_orders:,}")
+        col2.metric("Canceled Orders", f"{canceled_orders:,}", help="Canceled orders with cross-dock costs")
+        col3.metric("Total Rows", f"{len(df):,}")
+        col4.metric("Total Revenue", f"${total_revenue:,.0f}")
+        col5.metric("Total Cost", f"${total_cost:,.0f}")
+        col6.metric("Total Profit", f"${total_profit:,.0f}")
 
         # Cross-dock breakdown
         crossdock_pct = (crossdock_cost / total_cost * 100) if total_cost > 0 else 0
+
+        # TONU breakdown (show only if there are TONU charges)
+        if tonu_revenue > 0 or tonu_cost > 0:
+            col_t1, col_t2, col_t3 = st.columns(3)
+            col_t1.metric("TONU Revenue", f"${tonu_revenue:,.0f}", help="Revenue from TONU (Truck Order Not Used)")
+            col_t2.metric("TONU Cost", f"${tonu_cost:,.0f}", help="Cost from TONU charges")
+            tonu_pct = (tonu_cost / total_cost * 100) if total_cost > 0 else 0
+            col_t3.metric("TONU Cost %", f"{tonu_pct:.1f}%", help="TONU cost as % of total cost")
 
         st.info(f"💡 Cross-dock handling costs: ${crossdock_cost:,.0f} ({crossdock_pct:.1f}% of total cost)")
         

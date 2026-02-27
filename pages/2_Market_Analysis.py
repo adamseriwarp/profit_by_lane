@@ -35,7 +35,7 @@ default_end = datetime.now()
 start_date = col1.date_input("Start Date", default_start)
 end_date = col2.date_input("End Date", default_end)
 
-# Customer filter
+# Customer exclusion filter
 @st.cache_data(ttl=3600)
 def get_customers():
     query = """
@@ -49,165 +49,124 @@ def get_customers():
     return df['clientName'].tolist() if df is not None else []
 
 customers = get_customers()
-selected_customers = st.sidebar.multiselect("Customer", options=customers)
+excluded_customers = st.sidebar.multiselect("Exclude Customers", options=customers,
+    help="Select customers to EXCLUDE from the analysis")
 
-# --- Main Query ---
+# --- Smart Strategy V3 Date Field ---
+DATE_FIELD = """CASE
+    WHEN pickLocationName = dropLocationName THEN STR_TO_DATE(dropWindowFrom, '%m/%d/%Y %H:%i:%s')
+    WHEN dropTimeArrived IS NOT NULL AND dropTimeArrived != '' THEN STR_TO_DATE(dropTimeArrived, '%m/%d/%Y %H:%i:%s')
+    WHEN dropDateArrived IS NOT NULL AND dropDateArrived != '' THEN STR_TO_DATE(dropDateArrived, '%m/%d/%Y')
+    ELSE STR_TO_DATE(dropWindowFrom, '%m/%d/%Y %H:%i:%s')
+END"""
+
+
+# --- Main Query using Smart Strategy V3 ---
 @st.cache_data(ttl=300)
-def get_market_data(start_date, end_date, customers, shipment_type, include_crossdock):
+def get_market_data(start_date, end_date, excluded_customers, shipment_type, include_crossdock):
     """
-    Get profit by market (same start/end market).
+    Get profit by market (same start/end market) using Smart Strategy V3.
 
-    Logic by shipment type (same as Summary View):
-    - FTL: Use ALL rows (YES + NO) to capture cross-dock handling costs
-    - LTL Direct (single row): Use that row
-    - LTL Multi-leg: Use ONLY NO rows (YES row duplicates revenue)
-    - Parcel: Use ONLY mainShipment = 'YES' rows
+    Smart Strategy V3 reconciles YES and NO rows to avoid double-counting:
+    - Revenue: Use YES if present, else sum NO rows
+    - Cost: Use YES + cross-dock NO costs to capture all legs
     """
 
-    # Date logic:
-    # - Cross-dock leg (pickLocationName = dropLocationName): use dropWindowFrom
-    # - Regular leg with actual delivery: use dropDateArrived or dropTimeArrived
-    # - Regular leg without actual delivery: use dropWindowFrom
-    date_field = """
-        CASE
-            WHEN pickLocationName = dropLocationName THEN STR_TO_DATE(dropWindowFrom, '%m/%d/%Y %H:%i:%s')
-            WHEN dropTimeArrived IS NOT NULL AND dropTimeArrived != '' THEN STR_TO_DATE(dropTimeArrived, '%m/%d/%Y %H:%i:%s')
-            WHEN dropDateArrived IS NOT NULL AND dropDateArrived != '' THEN STR_TO_DATE(dropDateArrived, '%m/%d/%Y')
-            ELSE STR_TO_DATE(dropWindowFrom, '%m/%d/%Y %H:%i:%s')
-        END
-    """
-
+    # Include canceled orders with crossdock legs
     base_conditions = [
-        "shipmentStatus = 'Complete'",
-        "startMarket IS NOT NULL AND startMarket != ''",
-        "startMarket = endMarket",  # Same market filter
-        f"({date_field}) >= '{start_date}'",
-        f"({date_field}) <= '{end_date}'"
+        "(shipmentStatus = 'Complete' OR (shipmentStatus = 'canceled' AND pickLocationName = dropLocationName))",
+        f"({DATE_FIELD}) >= '{start_date}'",
+        f"({DATE_FIELD}) <= '{end_date}'"
     ]
 
-    if customers:
-        customers_str = "', '".join(customers)
-        base_conditions.append(f"clientName IN ('{customers_str}')")
+    if shipment_type != "All":
+        base_conditions.append(f"shipmentType = '{shipment_type}'")
 
-    crossdock_filter = ""
-    if not include_crossdock:
-        crossdock_filter = "AND pickLocationName != dropLocationName"
+    if excluded_customers:
+        customers_str = "', '".join(excluded_customers)
+        base_conditions.append(f"clientName NOT IN ('{customers_str}')")
 
     base_where = " AND ".join(base_conditions)
 
-    if shipment_type == "Full Truckload":
-        # FTL: Use ALL rows (YES + NO) to capture cross-dock handling costs
-        query = f"""
+    # Smart Strategy V3 CTE with canceled order handling
+    query = f"""
+    WITH order_metrics AS (
         SELECT
-            startMarket as market,
-            COUNT(DISTINCT orderCode) as order_count,
-            SUM(COALESCE(revenueAllocationNumber, 0)) as total_revenue,
-            SUM(COALESCE(costAllocationNumber, 0)) as total_cost,
-            SUM(COALESCE(revenueAllocationNumber, 0)) - SUM(COALESCE(costAllocationNumber, 0)) as total_profit,
-            SUM(CASE WHEN pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as crossdock_cost,
-            SUM(CASE WHEN pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as crossdock_revenue
+            orderCode,
+            MAX(CASE WHEN mainShipment = 'YES' THEN shipmentStatus END) as order_status,
+            -- Revenue metrics (Complete orders only)
+            SUM(CASE WHEN mainShipment = 'YES' AND shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as yes_rev,
+            SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as no_rev,
+            SUM(CASE WHEN mainShipment = 'NO' AND pickLocationName = dropLocationName AND shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as xd_leg_rev,
+            -- Cost metrics (Complete orders only)
+            SUM(CASE WHEN mainShipment = 'YES' AND shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as yes_cost,
+            SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as no_cost,
+            SUM(CASE WHEN mainShipment = 'NO' AND pickLocationName = dropLocationName AND shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as xd_no_cost,
+            -- Canceled order crossdock values
+            SUM(CASE WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as canceled_xd_rev,
+            SUM(CASE WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as canceled_xd_cost,
+            -- TONU metrics (Truck Order Not Used)
+            SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_revenue,
+            SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost,
+            -- Duplicate detection
+            MAX(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete' AND ABS(
+                COALESCE(costAllocationNumber, 0) - (
+                    SELECT SUM(COALESCE(costAllocationNumber, 0))
+                    FROM otp_reports o2
+                    WHERE o2.orderCode = otp_reports.orderCode
+                      AND o2.mainShipment = 'YES'
+                      AND o2.shipmentStatus = 'Complete'
+                )
+            ) < 1 THEN 1 ELSE 0 END) as has_matching_no_row,
+            COALESCE(MAX(CASE WHEN mainShipment = 'YES' THEN startMarket END), 'NA') as startMarket,
+            COALESCE(MAX(CASE WHEN mainShipment = 'YES' THEN endMarket END), 'NA') as endMarket
         FROM otp_reports
         WHERE {base_where}
-          AND shipmentType = 'Full Truckload'
-          {crossdock_filter}
-        GROUP BY startMarket
-        ORDER BY total_profit ASC
-        """
-
-    elif shipment_type == "Less Than Truckload":
-        # LTL: Need to handle direct vs multi-leg differently
-        query = f"""
-        WITH order_row_counts AS (
-            SELECT
-                orderCode,
-                COUNT(*) as total_rows
-            FROM otp_reports
-            WHERE {base_where}
-              AND shipmentType = 'Less Than Truckload'
-            GROUP BY orderCode
-        ),
-        filtered_rows AS (
-            SELECT o.*
-            FROM otp_reports o
-            JOIN order_row_counts orc ON o.orderCode = orc.orderCode
-            WHERE {base_where}
-              AND o.shipmentType = 'Less Than Truckload'
-              AND (
-                (orc.total_rows > 1 AND o.mainShipment = 'NO')
-                OR orc.total_rows = 1
-              )
-              {crossdock_filter}
-        )
+        GROUP BY orderCode
+    ),
+    order_calculated AS (
         SELECT
-            startMarket as market,
-            COUNT(DISTINCT orderCode) as order_count,
-            SUM(COALESCE(revenueAllocationNumber, 0)) as total_revenue,
-            SUM(COALESCE(costAllocationNumber, 0)) as total_cost,
-            SUM(COALESCE(revenueAllocationNumber, 0)) - SUM(COALESCE(costAllocationNumber, 0)) as total_profit,
-            SUM(CASE WHEN pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as crossdock_cost,
-            SUM(CASE WHEN pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as crossdock_revenue
-        FROM filtered_rows
-        GROUP BY startMarket
-        ORDER BY total_profit ASC
-        """
-
-    elif shipment_type == "Parcel":
-        # Parcel: Use mainShipment = 'YES' rows only
-        query = f"""
-        SELECT
-            startMarket as market,
-            COUNT(DISTINCT orderCode) as order_count,
-            SUM(COALESCE(revenueAllocationNumber, 0)) as total_revenue,
-            SUM(COALESCE(costAllocationNumber, 0)) as total_cost,
-            SUM(COALESCE(revenueAllocationNumber, 0)) - SUM(COALESCE(costAllocationNumber, 0)) as total_profit,
-            SUM(CASE WHEN pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as crossdock_cost,
-            SUM(CASE WHEN pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as crossdock_revenue
-        FROM otp_reports
-        WHERE {base_where}
-          AND shipmentType = 'Parcel'
-          AND mainShipment = 'YES'
-          {crossdock_filter}
-        GROUP BY startMarket
-        ORDER BY total_profit ASC
-        """
-
-    else:
-        # All shipment types - combine FTL logic + LTL logic + Parcel logic
-        query = f"""
-        WITH order_row_counts AS (
-            SELECT
-                orderCode,
-                shipmentType,
-                COUNT(*) as total_rows
-            FROM otp_reports
-            WHERE {base_where}
-            GROUP BY orderCode, shipmentType
-        ),
-        filtered_rows AS (
-            SELECT o.*
-            FROM otp_reports o
-            JOIN order_row_counts orc ON o.orderCode = orc.orderCode
-            WHERE {base_where}
-              AND (
-                o.shipmentType = 'Full Truckload'
-                OR (o.shipmentType = 'Less Than Truckload' AND orc.total_rows > 1 AND o.mainShipment = 'NO')
-                OR (o.shipmentType = 'Less Than Truckload' AND orc.total_rows = 1)
-                OR (o.shipmentType NOT IN ('Full Truckload', 'Less Than Truckload') AND o.mainShipment = 'YES')
-              )
-              {crossdock_filter}
-        )
-        SELECT
-            startMarket as market,
-            COUNT(DISTINCT orderCode) as order_count,
-            SUM(COALESCE(revenueAllocationNumber, 0)) as total_revenue,
-            SUM(COALESCE(costAllocationNumber, 0)) as total_cost,
-            SUM(COALESCE(revenueAllocationNumber, 0)) - SUM(COALESCE(costAllocationNumber, 0)) as total_profit,
-            SUM(CASE WHEN pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as crossdock_cost,
-            SUM(CASE WHEN pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as crossdock_revenue
-        FROM filtered_rows
-        GROUP BY startMarket
-        ORDER BY total_profit ASC
-        """
+            orderCode, startMarket, endMarket, order_status,
+            -- Revenue: Smart Strategy for Complete, XD only for canceled
+            CASE
+                WHEN order_status = 'canceled' THEN canceled_xd_rev
+                WHEN yes_rev > 0 AND no_rev = 0 THEN yes_rev
+                WHEN yes_rev = 0 THEN no_rev
+                WHEN ABS((no_rev - xd_leg_rev) - yes_rev) < 1 THEN no_rev
+                WHEN yes_rev > 2 * no_rev THEN yes_rev + no_rev
+                ELSE no_rev
+            END as smart_revenue,
+            -- Cost: Smart Strategy for Complete, XD only for canceled
+            CASE
+                WHEN order_status = 'canceled' THEN canceled_xd_cost
+                WHEN yes_cost > 0 AND no_cost = 0 THEN yes_cost
+                WHEN yes_cost = 0 AND no_cost > 0 THEN no_cost
+                WHEN ABS((no_cost - xd_no_cost) - yes_cost) < 20 THEN
+                    CASE WHEN has_matching_no_row = 1 THEN yes_cost ELSE yes_cost + no_cost END
+                WHEN no_cost > yes_cost * 5 THEN yes_cost + no_cost
+                ELSE yes_cost + xd_no_cost
+            END as smart_cost,
+            CASE WHEN order_status = 'canceled' THEN canceled_xd_cost ELSE xd_no_cost END as crossdock_cost,
+            tonu_revenue,
+            tonu_cost
+        FROM order_metrics
+        WHERE startMarket = endMarket  -- Same market filter
+          AND startMarket IS NOT NULL AND startMarket != '' AND startMarket != 'NA'
+    )
+    SELECT
+        startMarket as market,
+        COUNT(DISTINCT CASE WHEN order_status = 'Complete' THEN orderCode END) as completed_orders,
+        COUNT(DISTINCT CASE WHEN order_status = 'canceled' THEN orderCode END) as canceled_orders,
+        SUM(smart_revenue) as total_revenue,
+        SUM(smart_cost) as total_cost,
+        SUM(smart_revenue) - SUM(smart_cost) as total_profit,
+        SUM(crossdock_cost) as crossdock_cost,
+        SUM(tonu_revenue) as tonu_revenue,
+        SUM(tonu_cost) as tonu_cost
+    FROM order_calculated
+    GROUP BY startMarket
+    ORDER BY total_profit ASC
+    """
 
     return execute_query(query)
 
@@ -215,7 +174,7 @@ def get_market_data(start_date, end_date, customers, shipment_type, include_cros
 df = get_market_data(
     start_date.strftime('%Y-%m-%d'),
     end_date.strftime('%Y-%m-%d'),
-    selected_customers,
+    excluded_customers,
     shipment_type,
     include_crossdock
 )
@@ -225,30 +184,41 @@ if df is not None and len(df) > 0:
     total_revenue = df['total_revenue'].sum()
     total_cost = df['total_cost'].sum()
     total_profit = df['total_profit'].sum()
-    total_orders = df['order_count'].sum()
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Revenue", f"${total_revenue:,.0f}")
-    col2.metric("Total Cost", f"${total_cost:,.0f}")
-    col3.metric("Total Profit", f"${total_profit:,.0f}")
-    col4.metric("Total Orders", f"{total_orders:,.0f}")
-    
+    completed_orders = df['completed_orders'].sum()
+    canceled_orders = df['canceled_orders'].sum()
+    tonu_revenue = df['tonu_revenue'].sum() if 'tonu_revenue' in df.columns else 0
+    tonu_cost = df['tonu_cost'].sum() if 'tonu_cost' in df.columns else 0
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Completed Orders", f"{completed_orders:,.0f}")
+    col2.metric("Canceled Orders", f"{canceled_orders:,.0f}", help="Canceled orders with cross-dock costs")
+    col3.metric("Total Revenue", f"${total_revenue:,.0f}")
+    col4.metric("Total Cost", f"${total_cost:,.0f}")
+    col5.metric("Total Profit", f"${total_profit:,.0f}")
+
+    # TONU summary (show only if there are TONU charges)
+    if tonu_revenue > 0 or tonu_cost > 0:
+        col_t1, col_t2, col_t3 = st.columns(3)
+        col_t1.metric("TONU Revenue", f"${tonu_revenue:,.0f}", help="Revenue from TONU (Truck Order Not Used)")
+        col_t2.metric("TONU Cost", f"${tonu_cost:,.0f}", help="Cost from TONU charges")
+        tonu_pct = (tonu_cost / total_cost * 100) if total_cost > 0 else 0
+        col_t3.metric("TONU Cost %", f"{tonu_pct:.1f}%", help="TONU cost as % of total cost")
+
     st.markdown("---")
     st.subheader("Profit by Market")
     st.caption("Sorted by least profitable at top")
-    
-    # Format display
-    display_df = df.copy()
+
+    # Format display - exclude TONU columns from main display (already shown in summary)
+    display_df = df[['market', 'completed_orders', 'canceled_orders', 'total_revenue', 'total_cost', 'total_profit', 'crossdock_cost']].copy()
     display_df['margin_pct'] = (display_df['total_profit'] / display_df['total_revenue'] * 100).fillna(0)
-    display_df.columns = ['Market', 'Orders', 'Revenue', 'Cost', 'Profit', 'Cross-dock Cost', 'Cross-dock Revenue', 'Margin %']
-    
+    display_df.columns = ['Market', 'Completed', 'Canceled', 'Revenue', 'Cost', 'Profit', 'XD Cost', 'Margin %']
+
     st.dataframe(
         display_df.style.format({
             'Revenue': '${:,.0f}',
             'Cost': '${:,.0f}',
             'Profit': '${:,.0f}',
-            'Cross-dock Cost': '${:,.0f}',
-            'Cross-dock Revenue': '${:,.0f}',
+            'XD Cost': '${:,.0f}',
             'Margin %': '{:.1f}%'
         }),
         width='stretch',

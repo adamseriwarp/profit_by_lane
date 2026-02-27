@@ -582,6 +582,111 @@ COALESCE(MAX(CASE WHEN mainShipment = 'YES' THEN endMarket END), 'NA') as endMar
 
 ---
 
+### Canceled Order Handling
+
+**Rule**: Include canceled orders **only if** they have crossdock activity (incurred costs/revenue).
+
+#### Identification
+
+A **crossdock leg** is identified by: `pickLocationName = dropLocationName`
+
+#### Logic
+
+| Order Status | Has Crossdock Leg? | Tracking |
+|--------------|-------------------|----------|
+| `Complete` | N/A | Track ALL costs/revenue (normal Smart Strategy) |
+| `canceled` | YES | Track ONLY crossdock leg costs/revenue |
+| `canceled` | NO | **Exclude** from all metrics |
+| `removed` | N/A | **Exclude** from all metrics |
+
+#### Implementation
+
+```sql
+-- Base WHERE clause
+WHERE (
+    shipmentStatus = 'Complete'
+    OR (
+        shipmentStatus = 'canceled'
+        AND EXISTS (
+            SELECT 1 FROM otp_reports o2
+            WHERE o2.orderCode = otp_reports.orderCode
+              AND o2.pickLocationName = o2.dropLocationName
+        )
+    )
+)
+AND shipmentStatus != 'removed'
+```
+
+#### Revenue/Cost Extraction for Canceled Orders
+
+For canceled orders with crossdock activity:
+- **Revenue**: Sum revenue from crossdock legs only (`pickLocationName = dropLocationName`)
+- **Cost**: Sum cost from crossdock legs only (`pickLocationName = dropLocationName`)
+- **Lane**: Determined by `mainShipment = 'YES'` row (as usual)
+
+```sql
+-- For canceled orders, only count crossdock leg values
+SUM(CASE
+    WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
+    WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName
+        THEN COALESCE(revenueAllocationNumber, 0)
+    ELSE 0
+END) as revenue
+```
+
+#### Order Counting
+
+Track completed and canceled orders separately per lane:
+
+```sql
+COUNT(DISTINCT CASE WHEN shipmentStatus = 'Complete' THEN orderCode END) as completed_orders,
+COUNT(DISTINCT CASE WHEN shipmentStatus = 'canceled' THEN orderCode END) as canceled_orders
+```
+
+**Display**: Show as "X completed + Y canceled" or in separate columns.
+
+---
+
+### TONU (Truck Order Not Used) Handling
+
+**Definition**: TONU occurs when a carrier is dispatched but the load is canceled. The carrier gets paid (cost incurred) but typically no delivery revenue is generated.
+
+#### Identification
+
+A TONU is identified by: `accessorialType = 'TONU'` on any row for an order.
+
+- TONU is **per order** (attached to an `orderCode`)
+- The TONU row is typically on a `mainShipment = 'NO'` row
+- An order can have both regular shipment activity AND a TONU charge
+
+#### Tracking Logic
+
+| Metric | Definition |
+|--------|------------|
+| `tonu_revenue` | Revenue from rows where `accessorialType = 'TONU'` |
+| `tonu_cost` | Cost from rows where `accessorialType = 'TONU'` |
+| `tonu_orders` | Count of orders with any TONU row |
+
+#### Implementation
+
+```sql
+-- In order_metrics CTE, add:
+SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_revenue,
+SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost,
+MAX(CASE WHEN accessorialType = 'TONU' THEN 1 ELSE 0 END) as has_tonu
+
+-- For order counting:
+COUNT(DISTINCT CASE WHEN has_tonu = 1 THEN orderCode END) as tonu_orders
+```
+
+#### Treatment in Profitability
+
+- **TONU revenue/cost IS included** in total profit calculations
+- **TONU is tracked separately** as a summary statistic for visibility
+- **Display**: Show "TONU Revenue", "TONU Cost", and "TONU Orders" as separate metrics
+
+---
+
 ### LTL Smart Strategy ✅ (VALIDATED - 97.9% Match Rate Excluding Crossdock)
 
 **Key Finding**: LTL orders have three distinct revenue patterns in `otp_reports`. The "Smart Strategy" detects which pattern applies and selects the correct rows.
