@@ -1,0 +1,10 @@
+[[pages]]
+path = "app.py"
+name = "Summary View"
+icon = "📊"
+
+[[pages]]
+path = "pages/1_Drill_Down.py"
+name = "Drill Down"
+icon = "🔍"
+
