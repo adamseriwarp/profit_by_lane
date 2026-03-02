@@ -288,21 +288,22 @@ def get_lane_order_details(start_date, end_date, shipment_type, start_market, en
     base_where = get_base_conditions(start_date, end_date, shipment_type, excluded_customers)
 
     # Row-level: show all rows that belong to this lane
+    # Use CAST to avoid MySQL connector binary unpacking errors
     query = f"""
     SELECT
-        orderCode,
-        warpId,
-        clientName as customer,
-        shipmentStatus,
-        mainShipment,
-        pickLocationName,
-        dropLocationName,
-        startMarket,
-        endMarket,
-        dropWindowFrom as scheduled_delivery,
-        COALESCE(dropTimeArrived, dropDateArrived) as actual_delivery,
-        carrierName as carrier,
-        accessorialType,
+        CAST(orderCode AS CHAR) as orderCode,
+        CAST(warpId AS CHAR) as warpId,
+        CAST(clientName AS CHAR) as customer,
+        CAST(shipmentStatus AS CHAR) as shipmentStatus,
+        CAST(mainShipment AS CHAR) as mainShipment,
+        CAST(pickLocationName AS CHAR) as pickLocationName,
+        CAST(dropLocationName AS CHAR) as dropLocationName,
+        CAST(startMarket AS CHAR) as startMarket,
+        CAST(endMarket AS CHAR) as endMarket,
+        CAST(dropWindowFrom AS CHAR) as scheduled_delivery,
+        CAST(COALESCE(dropTimeArrived, dropDateArrived) AS CHAR) as actual_delivery,
+        CAST(carrierName AS CHAR) as carrier,
+        CAST(accessorialType AS CHAR) as accessorialType,
         CASE
             WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
             WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
