@@ -517,71 +517,6 @@ S-149131 | NO  | pick=02/27/2024 06:00:15 | drop=02/27/2024 10:09:40 | dStatus=S
 
 ## Revenue & Cost Calculations
 
-### 🎯 Smart Strategy V3 - Quick Reference (ORDER-LEVEL)
-
-This is the definitive strategy for calculating revenue and cost per order. Implemented in `Summary_View.py`.
-
-#### LTL Revenue Strategy
-
-| Priority | Condition | Action | Rationale |
-|----------|-----------|--------|-----------|
-| 1 | `yes_rev > 0 AND no_rev = 0` | Use `yes_rev` | YES-only pattern (direct shipment) |
-| 2 | `yes_rev = 0` | Use `no_rev` | NO-only pattern |
-| 3 | `ABS((no_rev - xd_leg_rev) - yes_rev) < $1` | Use `no_rev` | Duplicates - NO includes crossdock fees |
-| 4 | `yes_rev > 2 × no_rev` | `yes_rev + no_rev` | "Back to the Roots" additive pattern |
-| 5 | Default | Use `no_rev` | Capture any crossdock revenue |
-
-#### LTL Cost Strategy (V3 with Sub-Strategy)
-
-| Priority | Condition | Action | Rationale |
-|----------|-----------|--------|-----------|
-| 1 | `yes_cost > 0 AND no_cost = 0` | Use `yes_cost` | YES-only pattern |
-| 2 | `yes_cost = 0 AND no_cost > 0` | Use `no_cost` | NO-only pattern |
-| 3 | `ABS((no_cost - xd_no_cost) - yes_cost) < $20` | **Sub-strategy** ↓ | Costs appear similar |
-| 3a | ↳ `has_matching_no_row = 1` | Use `yes_cost` | **TRUE DUPLICATE** - NO row exactly matches YES |
-| 3b | ↳ Otherwise | `yes_cost + no_cost` | **FALSE POSITIVE** - costs are additive |
-| 4 | `no_cost > 5 × yes_cost` | `yes_cost + no_cost` | Separate legs (NO >> YES) |
-| 5 | Default | `yes_cost + xd_no_cost` | Main cost + crossdock fees only |
-
-#### Duplicate Detection Logic (Cost Only)
-
-```sql
--- Detects TRUE DUPLICATE: any single NO row cost matches total YES cost
-has_matching_no_row = MAX(CASE
-    WHEN mainShipment = 'NO'
-    AND ABS(costAllocationNumber - [total YES cost for order]) < $1
-    THEN 1 ELSE 0
-END)
-```
-
-#### Other Shipment Types
-
-| Type | Revenue Strategy | Cost Strategy |
-|------|------------------|---------------|
-| **FTL** | Sum ALL rows | Sum ALL rows |
-| **Parcel/Other** | `mainShipment = 'YES'` only | `mainShipment = 'YES'` only |
-
-#### Lane Definition (Order-Level)
-
-```sql
--- Always use YES row for lane, with 'NA' fallback for missing data
-COALESCE(MAX(CASE WHEN mainShipment = 'YES' THEN startMarket END), 'NA') as startMarket
-COALESCE(MAX(CASE WHEN mainShipment = 'YES' THEN endMarket END), 'NA') as endMarket
-```
-
-#### Key Variables
-
-| Variable | Definition |
-|----------|------------|
-| `yes_rev` | SUM of revenue from `mainShipment = 'YES'` rows |
-| `no_rev` | SUM of revenue from `mainShipment = 'NO'` rows |
-| `xd_leg_rev` | Revenue from NO rows where `pickLocationName = dropLocationName` (crossdock) |
-| `yes_cost` | SUM of cost from `mainShipment = 'YES'` rows |
-| `no_cost` | SUM of cost from `mainShipment = 'NO'` rows |
-| `xd_no_cost` | Cost from NO rows where `pickLocationName = dropLocationName` (crossdock) |
-
----
-
 ### Canceled Order Handling
 
 **Rule**: Include canceled orders **only if** they have crossdock activity (incurred costs/revenue).
@@ -594,7 +529,7 @@ A **crossdock leg** is identified by: `pickLocationName = dropLocationName`
 
 | Order Status | Has Crossdock Leg? | Tracking |
 |--------------|-------------------|----------|
-| `Complete` | N/A | Track ALL costs/revenue (normal Smart Strategy) |
+| `Complete` | N/A | Track ALL costs/revenue (Hybrid Approach) |
 | `canceled` | YES | Track ONLY crossdock leg costs/revenue |
 | `canceled` | NO | **Exclude** from all metrics |
 | `removed` | N/A | **Exclude** from all metrics |
@@ -647,7 +582,7 @@ COUNT(DISTINCT CASE WHEN shipmentStatus = 'canceled' THEN orderCode END) as canc
 
 ---
 
-### TONU (Truck Order Not Used) Handling
+### TONU (Truck Order Not Used) Handling ✅ (UPDATED)
 
 **Definition**: TONU occurs when a carrier is dispatched but the load is canceled. The carrier gets paid (cost incurred) but typically no delivery revenue is generated.
 
@@ -659,211 +594,26 @@ A TONU is identified by: `accessorialType = 'TONU'` on any row for an order.
 - The TONU row is typically on a `mainShipment = 'NO'` row
 - An order can have both regular shipment activity AND a TONU charge
 
-#### Tracking Logic
+#### ⚠️ TONU Status Handling (CRITICAL)
 
-| Metric | Definition |
-|--------|------------|
-| `tonu_revenue` | Revenue from rows where `accessorialType = 'TONU'` |
-| `tonu_cost` | Cost from rows where `accessorialType = 'TONU'` |
-| `tonu_orders` | Count of orders with any TONU row |
+**TONU rows must be included regardless of `shipmentStatus`.**
 
-#### Implementation
+TONU charges may have a `shipmentStatus` that is NOT 'Complete' or 'canceled'. To capture all TONU charges, the WHERE clause must explicitly include them:
 
 ```sql
--- In order_metrics CTE, add:
-SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_revenue,
-SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost,
-MAX(CASE WHEN accessorialType = 'TONU' THEN 1 ELSE 0 END) as has_tonu
+-- OLD (misses some TONU):
+WHERE shipmentStatus IN ('Complete', 'canceled')
 
--- For order counting:
-COUNT(DISTINCT CASE WHEN has_tonu = 1 THEN orderCode END) as tonu_orders
+-- NEW (includes all TONU):
+WHERE (shipmentStatus IN ('Complete', 'canceled') OR accessorialType = 'TONU')
 ```
 
 #### Treatment in Profitability
 
 - **TONU revenue/cost IS included** in total profit calculations
+- TONU charges are allocated to the lane based on THAT row's `startMarket → endMarket`
 - **TONU is tracked separately** as a summary statistic for visibility
 - **Display**: Show "TONU Revenue", "TONU Cost", and "TONU Orders" as separate metrics
-
----
-
-### LTL Smart Strategy ✅ (VALIDATED - 97.9% Match Rate Excluding Crossdock)
-
-**Key Finding**: LTL orders have three distinct revenue patterns in `otp_reports`. The "Smart Strategy" detects which pattern applies and selects the correct rows.
-
-#### The Three LTL Patterns
-
-| Pattern | % of Orders | YES Revenue | NO Revenue | Correct Action |
-|---------|-------------|-------------|------------|----------------|
-| **YES_ONLY** | ~40% | > 0 | = 0 | Use YES rows |
-| **NO_ONLY** | ~22% | = 0 | > 0 | Use NO rows |
-| **BOTH** | ~36% | > 0 | > 0 | See Refined Strategy below |
-
-#### Refined BOTH Pattern Strategy (with crossdock detection)
-
-For orders where both YES and NO rows have revenue, we use a 3-step decision process:
-
-```sql
--- Calculate crossdock leg revenue (legs where pick = drop location)
-xd_leg_rev = SUM(revenue WHERE mainShipment='NO' AND pickLocationName = dropLocationName)
-
-CASE
-    -- Step 1: If NO = YES + crossdock extra → USE NO (captures base + XD)
-    WHEN ABS((no_rev - xd_leg_rev) - yes_rev) < 1 THEN no_rev
-
-    -- Step 2: If YES is much larger than NO → USE YES (main revenue in YES, NO is small XD charges)
-    WHEN yes_rev >= 2 * no_rev THEN yes_rev
-
-    -- Step 3: Default → USE NO (captures crossdock revenue)
-    ELSE no_rev
-END
-```
-
-**Rationale**:
-- **Step 1 (Pattern A)**: When `(NO - XD) ≈ YES`, it means NO contains the base revenue plus crossdock extra. Using NO captures everything.
-- **Step 2 (Back to the Roots pattern)**: When `YES >= 2*NO`, the main revenue is in YES while NO only contains small crossdock charges. Using NO would lose the main revenue.
-- **Step 3 (Default)**: For other cases, default to NO to capture any crossdock revenue.
-
-#### Smart Strategy Summary
-
-```sql
-CASE
-    WHEN yes_rev > 0 AND no_rev = 0 THEN yes_rev    -- YES_ONLY: Use YES
-    WHEN yes_rev = 0 THEN no_rev                     -- NO_ONLY: Use NO
-    -- BOTH pattern (refined):
-    WHEN ABS((no_rev - xd_leg_rev) - yes_rev) < 1 THEN no_rev  -- NO = YES + XD
-    WHEN yes_rev >= 2 * no_rev THEN yes_rev                     -- YES is main revenue
-    ELSE no_rev                                                  -- Default to NO
-END
-```
-
-#### Match Rate Summary by Scenario
-
-**Match Definition**: Difference between `otp_reports` revenue and `orders` table < $20
-
-| Scenario | Orders | Match Rate | Notes |
-|----------|--------|------------|-------|
-| **ALL (excluding crossdock legs)** | 96,306 | **97.9%** | Near-perfect when XD excluded |
-| ├── YES_ONLY | 52,028 | 98.5% | Clear pattern |
-| ├── NO_ONLY | 16,369 | 97.5% | Clear pattern |
-| └── BOTH | 27,909 | 96.8% | Uses Smart Strategy |
-| | | | |
-| **BOTH + Crossdock orders** | 20,434 | ~30% | Expected - we capture XD that orders misses |
-| ├── Step 1 (NO=YES+XD) | 10,395 | 40.7% (NO) / 98.5% (YES) | We USE_NO to capture XD |
-| ├── Step 2 (YES>=2*NO) | 827 | 24.1% (YES) | Low match but aggregate is close |
-| └── Step 3 (Default) | 9,212 | 75.0% (NO) | Default to NO |
-
-#### Problematic Customers (Low Individual Match, Close Aggregate)
-
-These customers have low individual order match rates but close aggregate totals:
-
-| Customer | Orders | Match% | YES Total | Orders Total | Note |
-|----------|--------|--------|-----------|--------------|------|
-| Back to the Roots, Inc | 421 | 9.7% | $87,399 | $97,175 | Aggregate within 10% |
-| Back to the Roots (Saltbox) | 203 | 11.8% | $50,192 | $53,115 | Aggregate within 6% |
-| Imperfect Foods | 44 | 2.3% | $14,870 | $18,380 | Aggregate within 20% |
-
-**Example problematic orders (Back to the Roots)**:
-```
-Order            YES      NO      XD    Orders    Diff
-P-34761-2522    $790    $20     $20      $20    $770  ← YES much higher
-P-39787-2512    $905    $75     $75   $1,309    $404  ← YES lower than Orders
-P-112305-2523   $626   $300    $300     $926    $300  ← YES lower than Orders
-```
-
-**Key Insight**: For these problematic cases, neither YES nor NO matches orders perfectly. However:
-- Using YES gives aggregate revenue close to orders table
-- Using NO would give only ~$34K instead of ~$137K (way off)
-- Therefore, `YES >= 2*NO → USE_YES` is correct despite low individual match rate
-
-#### Validation Results
-
-| Scope | Orders | Match Rate |
-|-------|--------|------------|
-| Orders WITHOUT crossdock leg revenue | 96,306 | **97.9%** |
-| Orders WITH crossdock leg revenue | 32,801 | ~36% (expected - otp_reports captures XD) |
-| **Overall** | 129,107 | ~82% |
-
-**Note**: The ~18% "mismatch" is primarily:
-- **Crossdock leg revenue**: `otp_reports` correctly captures ~$574K extra that `orders` table is missing
-- **Data quality issues**: ~2% of orders (Back to the Roots, etc.) have data inconsistencies
-
-### LTL Cost Smart Strategy ✅ (VALIDATED - 84.3% Match Rate)
-
-**Key Finding**: LTL cost calculation requires different logic than revenue due to how costs are split between header (YES) and leg (NO) rows. The Cost Smart Strategy handles three key scenarios.
-
-#### Cost Strategy Overview
-
-| Scenario | Condition | Action | Rationale |
-|----------|-----------|--------|-----------|
-| **YES_ONLY** | yes_cost > 0, no_cost = 0 | Use YES | Single header row has all cost |
-| **NO_ONLY** | yes_cost = 0, no_cost > 0 | Use NO | Cost on legs only |
-| **Scenario 3** | (NO - XD) ≈ YES | Sub-strategy (see below) | Potential duplicate or additive |
-| **NO >> YES** | no_cost > yes_cost × 5 | SUM (yes + no) | Separate legs (e.g., Sway orders) |
-| **DEFAULT** | All other cases | YES + XD | Main cost in YES, plus crossdock fees |
-
-#### Scenario 3 Sub-Strategy (Duplicate Detection)
-
-When `(NO - XD) ≈ YES` (difference < $20), we need to determine if it's a **true duplicate** or **false positive**:
-
-```sql
--- Sub-strategy for Scenario 3
-CASE
-    WHEN has_matching_no_row = 1 THEN yes_cost      -- TRUE DUPLICATE → use YES
-    ELSE yes_cost + no_cost                          -- FALSE POSITIVE → SUM
-END
-
--- Where has_matching_no_row is:
-MAX(CASE WHEN mainShipment = 'NO' AND ABS(costAllocationNumber - yes_cost) < 1 THEN 1 ELSE 0 END)
-```
-
-**True Duplicate**: When an individual NO row's cost matches the YES cost (within $1), the YES row is just a copy of one leg's cost. Use YES.
-- Example: P-50259-2531 has YES=$1,000, and one NO row has exactly $1,000 → Use YES ($1,000)
-
-**False Positive**: When (NO-XD) ≈ YES but no individual NO row matches, the costs are additive. Use SUM.
-- Example: P-124389-2550 has YES=$162, NO=$165, but no single NO row has $162 → Use SUM ($327)
-
-#### Full Cost Smart Strategy SQL
-
-```sql
-CASE
-    WHEN yes_cost > 0 AND no_cost = 0 THEN yes_cost
-    WHEN yes_cost = 0 AND no_cost > 0 THEN no_cost
-    -- Scenario 3: (NO-XD) ≈ YES - apply sub-strategy
-    WHEN ABS((no_cost - xd_no_cost) - yes_cost) < 20 THEN
-        CASE
-            WHEN has_matching_no_row = 1 THEN yes_cost  -- TRUE DUPLICATE
-            ELSE yes_cost + no_cost                      -- FALSE POSITIVE → SUM
-        END
-    -- NO >> YES (5x) - separate legs, sum both
-    WHEN no_cost > yes_cost * 5 THEN yes_cost + no_cost
-    -- DEFAULT: YES has main cost, add crossdock fees
-    ELSE yes_cost + xd_no_cost
-END
-```
-
-#### Match Rate Summary by Category
-
-| Category | Orders | Match% | Notes |
-|----------|--------|--------|-------|
-| 1: YES_ONLY | 40,184 | **99.9%** | Clear pattern |
-| 2: NO_ONLY | 76,332 | **78.9%** | otp_reports captures more cost |
-| 3a: TRUE_DUPLICATE → YES | 115 | 28.7% | Using YES (otp_reports more accurate) |
-| 3b: FALSE_POS → SUM | 234 | 18.8% | Using SUM (otp_reports more accurate) |
-| 4: NO >> YES → SUM | 156 | 52.6% | Sway/multi-leg orders |
-| 5: DEFAULT → YES+XD | 13,655 | **70.0%** | Main cost + crossdock |
-| **TOTAL** | 130,676 | **84.3%** | |
-
-**Note**: Lower match rates in categories 3a, 3b, and 4 are expected because `otp_reports` captures leg costs that the `orders` table is missing.
-
-#### Key Differences: Revenue vs Cost Strategy
-
-| Aspect | Revenue Strategy | Cost Strategy |
-|--------|------------------|---------------|
-| **Scenario 3 (≈ match)** | Use NO | Sub-strategy: TRUE_DUP → YES, FALSE_POS → SUM |
-| **Detection method** | Cost proximity only | Cost proximity + row-level matching |
-| **NO >> YES** | Not explicitly handled | SUM (captures multi-leg costs) |
-| **Default** | Use NO | YES + XD (crossdock fees) |
 
 ---
 
@@ -907,29 +657,38 @@ S-150608     NO          0.00       0.00   Bound Brook    Wilkes-Barre   ← $0
 
 | Data | Source of Truth | Notes |
 |------|-----------------|-------|
-| **Revenue** | `otp_reports` (Smart Strategy) | More complete than `orders` - captures crossdock fees |
-| **Cost** | `otp_reports` (Smart Strategy) | More complete than `orders` - `orders.costAllocation` is often incomplete |
-| **Lane Definition** | `mainShipment = YES` row | startMarket → endMarket for multi-leg |
+| **Revenue** | `otp_reports` (Row-Level) | Each row's `revenueAllocationNumber` → that row's lane |
+| **Cost** | `otp_reports` (Row-Level) | Each row's `costAllocationNumber` → that row's lane |
+| **Lane Definition** | Each row's own `startMarket → endMarket` | Row-level allocation, not order-level |
 | **Per-leg detail** | `mainShipment = NO` rows | Individual leg metrics |
 
 > **Note**: The `orders` table was previously considered the source of truth, but analysis shows that `otp_reports` contains more complete/accurate data for both revenue and cost, particularly for LTL shipments with crossdocks or multiple legs.
 
-### Revenue/Cost Counting Rules ✅ (UPDATED)
+### Revenue/Cost Counting Rules ✅ (ROW-LEVEL ALLOCATION)
 
-| Scenario | Recommended Approach | Why |
-|----------|---------------------|-----|
-| **LTL (using otp_reports)** | **Smart Strategy** | Detects pattern and picks correct rows |
-| **FTL direct** | Use the single `mainShipment = YES` row | Only one row exists |
-| **FTL multidrop** | Sum ALL YES rows | Each is separate drop, no duplication |
-| **Order-level revenue** | `orders.revenueAllocation` | But may miss crossdock revenue |
+**IMPORTANT**: Each row's revenue and cost is allocated to THAT row's `startMarket → endMarket` lane.
 
-### Lane Definition for Multi-Leg Orders
+| Scenario | Revenue | Cost |
+|----------|---------|------|
+| **All rows** | `revenueAllocationNumber` → row's lane | `costAllocationNumber` → row's lane |
+| **Complete orders** | Full revenue counted | Full cost counted |
+| **Canceled orders** | Only crossdock leg revenue | Only crossdock leg cost |
+| **TONU charges** | Included regardless of status | Included regardless of status |
 
-For LTL multi-leg orders, the **lane** is defined by the `mainShipment = YES` row:
-- **Origin Market**: `startMarket` from YES row
-- **Destination Market**: `endMarket` from YES row
+### Lane Definition for Multi-Leg Orders ✅ (ROW-LEVEL)
 
-This ensures consistent lane attribution regardless of which rows are used for revenue calculation.
+For LTL multi-leg orders, **each row** contributes to its OWN lane:
+- Each row's revenue → that row's `startMarket → endMarket` lane
+- Each row's cost → that row's `startMarket → endMarket` lane
+
+**Example**: Dallas → Houston order with crossdock:
+| Row | Type | startMarket | endMarket | Revenue | Cost | Lane Allocated |
+|-----|------|-------------|-----------|---------|------|----------------|
+| 1 | YES | Dallas | Houston | $1,200 | $0 | Dallas → Houston |
+| 2 | NO (leg) | Dallas | Crossdock | $0 | $300 | Dallas → Crossdock |
+| 3 | NO (leg) | Crossdock | Houston | $0 | $500 | Crossdock → Houston |
+
+This gives visibility into which **specific legs** are profitable vs costly.
 
 ### Relevant Columns
 
@@ -945,73 +704,86 @@ This ensures consistent lane attribution regardless of which rows are used for r
 
 ---
 
-### Hybrid Approach for Lane-Level Analysis ✅ (VALIDATED)
+### Row-Level Lane Allocation ✅ (CURRENT APPROACH)
 
-**Purpose**: When analyzing profitability at the **lane level** (individual legs like Chicago → Dallas), use the `mainShipment = 'NO'` rows when they have allocation, otherwise fall back to the `mainShipment = 'YES'` row.
+**Purpose**: Allocate each row's revenue and cost to THAT row's `startMarket → endMarket` lane.
 
-**Context**: The CEO suggested using `revenueAllocationNumber` and `costAllocationNumber` on leg rows (`mainShipment = 'NO'`) to allocate revenue/cost to individual lanes. This was validated against 107,160 LTL Complete orders from 2025.
+This gives visibility into which **specific legs/segments** are profitable vs costly, rather than treating the entire order as a single lane.
 
-#### Validation Results
-
-| Metric | Value |
-|--------|-------|
-| Total LTL Complete orders (2025) | 107,160 |
-| Main-only revenue | $31,538,112.86 |
-| Hybrid revenue | $31,299,393.63 |
-| **Difference** | **-$238,719 (-0.76%)** ✅ |
-
-#### How Orders Break Down
-
-| Category | Orders | % |
-|----------|--------|---|
-| **Use legs** (have allocation) | 61,219 | 55.7% |
-| **Use main** (no legs or no allocation) | 48,695 | 44.3% |
-
-#### Hybrid Logic
+#### Core Logic
 
 ```sql
--- For each order, determine which source to use:
-CASE
-    WHEN leg_count > 0 AND sum_leg_allocation > 0 THEN 'USE_LEGS'
-    ELSE 'USE_MAIN'
-END
+-- Simple row-level aggregation by lane
+SELECT
+    COALESCE(startMarket, 'NA') as startMarket,
+    COALESCE(endMarket, 'NA') as endMarket,
+    -- Revenue: each row's revenueAllocationNumber to its own lane
+    SUM(CASE
+        WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
+        WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
+        WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0)
+        ELSE 0
+    END) as total_revenue,
+    -- Cost: each row's costAllocationNumber to its own lane
+    SUM(CASE
+        WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
+        WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
+        WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0)
+        ELSE 0
+    END) as total_cost
+FROM otp_reports
+WHERE (shipmentStatus IN ('Complete', 'canceled') OR accessorialType = 'TONU')
+  AND startMarket IS NOT NULL AND startMarket != ''
+  AND endMarket IS NOT NULL AND endMarket != ''
+GROUP BY startMarket, endMarket
 ```
 
-**When to use legs (`mainShipment = 'NO'`):**
-- Order has leg rows (`mainShipment = 'NO'`)
-- Legs have `revenueAllocationNumber > 0` (for revenue) or `costAllocationNumber > 0` (for cost)
-- Each leg represents a lane: `pickCity → dropCity`
+#### Key Points
 
-**When to fall back to main (`mainShipment = 'YES'`):**
-- Order has no leg rows
-- Legs exist but have $0 allocation (typically crossdock-only orders)
-- Lane = main row's `pickCity → dropCity` (entire route as one "lane")
+1. **Each row contributes to its OWN lane** based on that row's `startMarket → endMarket`
+2. **TONU charges included** regardless of `shipmentStatus`
+3. **Canceled orders**: Only count crossdock leg revenue/cost (where `pickLocationName = dropLocationName`)
+4. **Multi-leg orders**: Costs get spread across multiple lanes (e.g., Dallas→Crossdock and Crossdock→Houston)
 
-#### Why Some Orders Have No Leg Allocation
+#### Example: Multi-Leg Order
 
-**Key Finding**: 94.8% of orders where `main.total > 0` but `sum(leg.allocation) = 0` have **only crossdock legs**.
+For a Dallas → Houston LTL order with crossdock:
 
-A **crossdock leg** is identified by: `pickLocationName = dropLocationName`
+| Row | mainShipment | startMarket | endMarket | Revenue | Cost | Lane |
+|-----|--------------|-------------|-----------|---------|------|------|
+| 1 | YES | Dallas | Houston | $1,200 | $0 | Dallas → Houston |
+| 2 | NO | Dallas | XD_A | $0 | $300 | Dallas → XD_A |
+| 3 | NO | XD_A | Houston | $0 | $500 | XD_A → Houston |
 
-Crossdock legs are internal warehouse transfers, not real delivery legs, so they don't need revenue allocation. For these orders, fall back to the main row.
+**Result**:
+- Dallas → Houston lane gets: +$1,200 revenue, $0 cost
+- Dallas → XD_A lane gets: $0 revenue, +$300 cost
+- XD_A → Houston lane gets: $0 revenue, +$500 cost
 
-#### The -0.76% Difference Explained
+This reveals which segments are cost centers vs profit centers.
 
-- **20,829 orders** have leg allocation < main.total (under-allocated)
-- **3,239 orders** have leg allocation > main.total (over-allocated, possibly rebills/duplicates)
-- On net, slightly under-allocated, but <1% is acceptable
+#### Historical Note: Hybrid Approach (Deprecated)
+
+Previously, we used a "Hybrid Approach" that:
+- Grouped by `orderCode` first
+- Used leg revenue when available, fell back to main row's `total`
+- Assigned entire order to the YES row's lane
+
+This was replaced with row-level allocation to give better visibility into segment profitability.
 
 #### Implementation Notes
 
-1. **For lane-level revenue dashboards**: Use the hybrid approach (legs when available, else main)
-2. **For order-level totals**: Continue using the Smart Strategy (Section above)
-3. **Lane granularity trade-off**: When falling back to main, the entire route becomes one "lane" (e.g., Chicago → Houston instead of Chicago → Dallas + Dallas → Houston)
+1. **For ALL dashboards**: Use row-level allocation (each row's revenue/cost → that row's lane)
+2. **WHERE clause**: Always include `(shipmentStatus IN ('Complete', 'canceled') OR accessorialType = 'TONU')`
+3. **Canceled orders**: Only count crossdock leg values (where `pickLocationName = dropLocationName`)
 
 ---
 
-### Lane Definition ✅ (VALIDATED)
+### Lane Definition ✅ (ROW-LEVEL)
 
 **Use `startMarket → endMarket` for lane-level analysis**, NOT `pickCity → dropCity`.
+
+**IMPORTANT**: Each row defines its OWN lane. A multi-leg order may contribute to MULTIPLE different lanes.
 
 #### Why Markets Instead of Cities
 
@@ -1035,24 +807,33 @@ Crossdock legs are internal warehouse transfers, not real delivery legs, so they
 | `pickCity` | Origin city name | Los Angeles, Newark |
 | `dropCity` | Destination city name | San Francisco, Chicago |
 
-#### Lane Definition SQL
+#### Lane Definition SQL (Row-Level)
 
 ```sql
--- Lane = startMarket → endMarket
+-- Lane = each row's startMarket → endMarket
+-- Includes TONU regardless of shipmentStatus
 SELECT
     startMarket,
     endMarket,
     CONCAT(startMarket, ' → ', endMarket) as lane,
-    SUM(COALESCE(revenueAllocationNumber, 0)) as lane_revenue,
-    SUM(COALESCE(costAllocationNumber, 0)) as lane_cost,
-    SUM(COALESCE(revenueAllocationNumber, 0)) - SUM(COALESCE(costAllocationNumber, 0)) as lane_profit
+    SUM(CASE
+        WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
+        WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
+        WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0)
+        ELSE 0
+    END) as lane_revenue,
+    SUM(CASE
+        WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
+        WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
+        WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0)
+        ELSE 0
+    END) as lane_cost
 FROM otp_reports
-WHERE shipmentType = 'Less Than Truckload'
-  AND shipmentStatus = 'Complete'
+WHERE (shipmentStatus IN ('Complete', 'canceled') OR accessorialType = 'TONU')
   AND startMarket IS NOT NULL AND startMarket != ''
   AND endMarket IS NOT NULL AND endMarket != ''
 GROUP BY startMarket, endMarket
-ORDER BY lane_profit DESC
+ORDER BY (lane_revenue - lane_cost) DESC
 ```
 
 ---

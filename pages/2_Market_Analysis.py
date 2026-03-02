@@ -52,7 +52,7 @@ customers = get_customers()
 excluded_customers = st.sidebar.multiselect("Exclude Customers", options=customers,
     help="Select customers to EXCLUDE from the analysis")
 
-# --- Smart Strategy V3 Date Field ---
+# --- Date Field for queries ---
 DATE_FIELD = """CASE
     WHEN pickLocationName = dropLocationName THEN STR_TO_DATE(dropWindowFrom, '%m/%d/%Y %H:%i:%s')
     WHEN dropTimeArrived IS NOT NULL AND dropTimeArrived != '' THEN STR_TO_DATE(dropTimeArrived, '%m/%d/%Y %H:%i:%s')
@@ -61,22 +61,23 @@ DATE_FIELD = """CASE
 END"""
 
 
-# --- Main Query using Smart Strategy V3 ---
+# --- Main Query using Hybrid Approach ---
 @st.cache_data(ttl=300)
 def get_market_data(start_date, end_date, excluded_customers, shipment_type, include_crossdock):
     """
-    Get profit by market (same start/end market) using Smart Strategy V3.
+    Get profit by market (same start/end market) using row-level lane allocation.
 
-    Smart Strategy V3 reconciles YES and NO rows to avoid double-counting:
-    - Revenue: Use YES if present, else sum NO rows
-    - Cost: Use YES + cross-dock NO costs to capture all legs
+    Each row's revenue/cost is allocated to THAT row's lane.
+    Includes TONU regardless of shipmentStatus.
     """
 
-    # Include canceled orders with crossdock legs
+    # Include: Complete orders + Canceled orders + TONU (regardless of status)
     base_conditions = [
-        "(shipmentStatus = 'Complete' OR (shipmentStatus = 'canceled' AND pickLocationName = dropLocationName))",
+        "(shipmentStatus IN ('Complete', 'canceled') OR accessorialType = 'TONU')",
         f"({DATE_FIELD}) >= '{start_date}'",
-        f"({DATE_FIELD}) <= '{end_date}'"
+        f"({DATE_FIELD}) <= '{end_date}'",
+        "startMarket = endMarket",  -- Same market filter for within-market analysis
+        "startMarket IS NOT NULL AND startMarket != ''"
     ]
 
     if shipment_type != "All":
@@ -88,84 +89,44 @@ def get_market_data(start_date, end_date, excluded_customers, shipment_type, inc
 
     base_where = " AND ".join(base_conditions)
 
-    # Smart Strategy V3 CTE with canceled order handling
+    # Row-level allocation: each row's revenue/cost goes to that row's market
     query = f"""
-    WITH order_metrics AS (
-        SELECT
-            orderCode,
-            MAX(CASE WHEN mainShipment = 'YES' THEN shipmentStatus END) as order_status,
-            -- Revenue metrics (Complete orders only)
-            SUM(CASE WHEN mainShipment = 'YES' AND shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as yes_rev,
-            SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as no_rev,
-            SUM(CASE WHEN mainShipment = 'NO' AND pickLocationName = dropLocationName AND shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as xd_leg_rev,
-            -- Cost metrics (Complete orders only)
-            SUM(CASE WHEN mainShipment = 'YES' AND shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as yes_cost,
-            SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as no_cost,
-            SUM(CASE WHEN mainShipment = 'NO' AND pickLocationName = dropLocationName AND shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as xd_no_cost,
-            -- Canceled order crossdock values
-            SUM(CASE WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as canceled_xd_rev,
-            SUM(CASE WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as canceled_xd_cost,
-            -- TONU metrics (Truck Order Not Used)
-            SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_revenue,
-            SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost,
-            -- Duplicate detection
-            MAX(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete' AND ABS(
-                COALESCE(costAllocationNumber, 0) - (
-                    SELECT SUM(COALESCE(costAllocationNumber, 0))
-                    FROM otp_reports o2
-                    WHERE o2.orderCode = otp_reports.orderCode
-                      AND o2.mainShipment = 'YES'
-                      AND o2.shipmentStatus = 'Complete'
-                )
-            ) < 1 THEN 1 ELSE 0 END) as has_matching_no_row,
-            COALESCE(MAX(CASE WHEN mainShipment = 'YES' THEN startMarket END), 'NA') as startMarket,
-            COALESCE(MAX(CASE WHEN mainShipment = 'YES' THEN endMarket END), 'NA') as endMarket
-        FROM otp_reports
-        WHERE {base_where}
-        GROUP BY orderCode
-    ),
-    order_calculated AS (
-        SELECT
-            orderCode, startMarket, endMarket, order_status,
-            -- Revenue: Smart Strategy for Complete, XD only for canceled
-            CASE
-                WHEN order_status = 'canceled' THEN canceled_xd_rev
-                WHEN yes_rev > 0 AND no_rev = 0 THEN yes_rev
-                WHEN yes_rev = 0 THEN no_rev
-                WHEN ABS((no_rev - xd_leg_rev) - yes_rev) < 1 THEN no_rev
-                WHEN yes_rev > 2 * no_rev THEN yes_rev + no_rev
-                ELSE no_rev
-            END as smart_revenue,
-            -- Cost: Smart Strategy for Complete, XD only for canceled
-            CASE
-                WHEN order_status = 'canceled' THEN canceled_xd_cost
-                WHEN yes_cost > 0 AND no_cost = 0 THEN yes_cost
-                WHEN yes_cost = 0 AND no_cost > 0 THEN no_cost
-                WHEN ABS((no_cost - xd_no_cost) - yes_cost) < 20 THEN
-                    CASE WHEN has_matching_no_row = 1 THEN yes_cost ELSE yes_cost + no_cost END
-                WHEN no_cost > yes_cost * 5 THEN yes_cost + no_cost
-                ELSE yes_cost + xd_no_cost
-            END as smart_cost,
-            CASE WHEN order_status = 'canceled' THEN canceled_xd_cost ELSE xd_no_cost END as crossdock_cost,
-            tonu_revenue,
-            tonu_cost
-        FROM order_metrics
-        WHERE startMarket = endMarket  -- Same market filter
-          AND startMarket IS NOT NULL AND startMarket != '' AND startMarket != 'NA'
-    )
     SELECT
         startMarket as market,
-        COUNT(DISTINCT CASE WHEN order_status = 'Complete' THEN orderCode END) as completed_orders,
-        COUNT(DISTINCT CASE WHEN order_status = 'canceled' THEN orderCode END) as canceled_orders,
-        SUM(smart_revenue) as total_revenue,
-        SUM(smart_cost) as total_cost,
-        SUM(smart_revenue) - SUM(smart_cost) as total_profit,
-        SUM(crossdock_cost) as crossdock_cost,
-        SUM(tonu_revenue) as tonu_revenue,
-        SUM(tonu_cost) as tonu_cost
-    FROM order_calculated
+        COUNT(DISTINCT CASE WHEN shipmentStatus = 'Complete' THEN orderCode END) as completed_orders,
+        COUNT(DISTINCT CASE WHEN shipmentStatus = 'canceled' THEN orderCode END) as canceled_orders,
+        SUM(CASE
+            WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
+            WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
+            WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0)
+            ELSE 0
+        END) as total_revenue,
+        SUM(CASE
+            WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
+            WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
+            WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0)
+            ELSE 0
+        END) as total_cost,
+        SUM(CASE
+            WHEN pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
+            ELSE 0
+        END) as crossdock_cost,
+        SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_revenue,
+        SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost
+    FROM otp_reports
+    WHERE {base_where}
     GROUP BY startMarket
-    ORDER BY total_profit ASC
+    ORDER BY (SUM(CASE
+            WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
+            WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
+            WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0)
+            ELSE 0
+        END) - SUM(CASE
+            WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
+            WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
+            WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0)
+            ELSE 0
+        END)) ASC
     """
 
     return execute_query(query)

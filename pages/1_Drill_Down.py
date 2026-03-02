@@ -110,7 +110,7 @@ def get_order_details(start_date, end_date, drill_type, selected_value, selected
 
     NOTE: This returns RAW rows for display/investigation. The summary metrics
     at the top of the page use get_order_summary_metrics() which applies the
-    proper Revenue and Cost Smart Strategies.
+    Hybrid Approach for revenue and sum-all for cost.
     """
 
     # Date logic:
@@ -190,45 +190,13 @@ def get_order_details(start_date, end_date, drill_type, selected_value, selected
         """
 
     elif shipment_type == "Less Than Truckload":
-        # LTL: Smart Strategy based on revenue pattern (refined BOTH logic)
+        # LTL: Show all rows (YES + NO) for drill-down investigation
         query = f"""
-        WITH order_pattern AS (
-            SELECT
-                orderCode,
-                SUM(CASE WHEN mainShipment = 'YES' AND shipmentStatus != 'removed' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as yes_rev,
-                SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus != 'removed' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as no_rev,
-                SUM(CASE WHEN mainShipment = 'NO' AND pickLocationName = dropLocationName AND shipmentStatus != 'removed'
-                    THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as xd_leg_rev
-            FROM otp_reports
-            WHERE {base_where}
-              AND shipmentType = 'Less Than Truckload'
-            GROUP BY orderCode
-        ),
-        order_strategy AS (
-            SELECT
-                orderCode,
-                CASE
-                    WHEN yes_rev > 0 AND no_rev = 0 THEN 'USE_YES'
-                    WHEN yes_rev = 0 THEN 'USE_NO'
-                    -- BOTH pattern: refined logic
-                    WHEN ABS((no_rev - xd_leg_rev) - yes_rev) < 1 THEN 'USE_NO'  -- NO = YES + XD
-                    WHEN yes_rev > 2 * no_rev THEN 'USE_BOTH'                     -- YES + NO both contribute
-                    ELSE 'USE_NO'                                                  -- Default to capture XD
-                END as strategy
-            FROM order_pattern
-        )
-        SELECT {select_cols_aliased}
-        FROM otp_reports o
-        JOIN order_strategy os ON o.orderCode = os.orderCode
+        SELECT {select_cols_simple}
+        FROM otp_reports
         WHERE {base_where}
-          AND o.shipmentType = 'Less Than Truckload'
-          AND o.shipmentStatus != 'removed'
-          AND (
-            (os.strategy = 'USE_YES' AND o.mainShipment = 'YES')
-            OR (os.strategy = 'USE_NO' AND o.mainShipment = 'NO')
-            OR (os.strategy = 'USE_BOTH')  -- Use all rows (YES + NO)
-          )
-        ORDER BY o.orderCode, o.mainShipment DESC, o.warpId
+          AND shipmentType = 'Less Than Truckload'
+        ORDER BY orderCode, mainShipment DESC, warpId
         LIMIT 5000
         """
 
@@ -245,48 +213,18 @@ def get_order_details(start_date, end_date, drill_type, selected_value, selected
         """
 
     else:
-        # All: Combine FTL (all rows) + LTL Smart Strategy + Parcel (YES only)
+        # All: Show all rows for FTL and LTL, YES only for Parcel
         query = f"""
-        WITH ltl_order_pattern AS (
-            SELECT
-                orderCode,
-                SUM(CASE WHEN mainShipment = 'YES' AND shipmentStatus != 'removed' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as yes_rev,
-                SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus != 'removed' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as no_rev,
-                SUM(CASE WHEN mainShipment = 'NO' AND pickLocationName = dropLocationName AND shipmentStatus != 'removed'
-                    THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as xd_leg_rev
-            FROM otp_reports
-            WHERE {base_where}
-              AND shipmentType = 'Less Than Truckload'
-            GROUP BY orderCode
-        ),
-        ltl_order_strategy AS (
-            SELECT
-                orderCode,
-                CASE
-                    WHEN yes_rev > 0 AND no_rev = 0 THEN 'USE_YES'
-                    WHEN yes_rev = 0 THEN 'USE_NO'
-                    -- BOTH pattern: refined logic
-                    WHEN ABS((no_rev - xd_leg_rev) - yes_rev) < 1 THEN 'USE_NO'  -- NO = YES + XD
-                    WHEN yes_rev > 2 * no_rev THEN 'USE_BOTH'                     -- YES + NO both contribute
-                    ELSE 'USE_NO'                                                  -- Default to capture XD
-                END as strategy
-            FROM ltl_order_pattern
-        )
-        SELECT {select_cols_aliased}
-        FROM otp_reports o
-        LEFT JOIN ltl_order_strategy los ON o.orderCode = los.orderCode
+        SELECT {select_cols_simple}
+        FROM otp_reports
         WHERE {base_where}
           AND (
-            -- FTL: use ALL rows
-            o.shipmentType = 'Full Truckload'
-            -- LTL: use Smart Strategy
-            OR (o.shipmentType = 'Less Than Truckload' AND o.shipmentStatus != 'removed' AND los.strategy = 'USE_YES' AND o.mainShipment = 'YES')
-            OR (o.shipmentType = 'Less Than Truckload' AND o.shipmentStatus != 'removed' AND los.strategy = 'USE_NO' AND o.mainShipment = 'NO')
-            OR (o.shipmentType = 'Less Than Truckload' AND o.shipmentStatus != 'removed' AND los.strategy = 'USE_BOTH')
-            -- Parcel and others: use YES rows only
-            OR (o.shipmentType NOT IN ('Full Truckload', 'Less Than Truckload') AND o.mainShipment = 'YES')
+            -- FTL and LTL: show all rows
+            shipmentType IN ('Full Truckload', 'Less Than Truckload')
+            -- Parcel: use YES rows only
+            OR (shipmentType = 'Parcel' AND mainShipment = 'YES')
           )
-        ORDER BY o.orderCode, o.mainShipment DESC, o.warpId
+        ORDER BY orderCode, mainShipment DESC, warpId
         LIMIT 5000
         """
 
@@ -296,10 +234,10 @@ def get_order_details(start_date, end_date, drill_type, selected_value, selected
 @st.cache_data(ttl=300)
 def get_order_summary_metrics(start_date, end_date, drill_type, selected_value, selected_lane, shipment_type):
     """
-    Calculate summary metrics using proper Smart Strategies for Revenue and Cost.
+    Calculate summary metrics using row-level lane allocation.
 
-    Revenue Strategy: Refined BOTH logic (same as before)
-    Cost Strategy: V3 with sub-strategy (TRUE_DUPLICATE → YES, FALSE_POS → SUM)
+    Each row's revenue/cost is allocated to THAT row's lane.
+    Includes TONU regardless of shipmentStatus.
     """
     # Build base WHERE conditions
     date_field = """
@@ -311,9 +249,9 @@ def get_order_summary_metrics(start_date, end_date, drill_type, selected_value, 
         END
     """
 
-    # Include canceled orders with crossdock legs
+    # Include: Complete orders + Canceled orders + TONU (regardless of status)
     base_conditions = [
-        "(shipmentStatus = 'Complete' OR (shipmentStatus = 'canceled' AND pickLocationName = dropLocationName))",
+        "(shipmentStatus IN ('Complete', 'canceled') OR accessorialType = 'TONU')",
         f"({date_field}) >= '{start_date}'",
         f"({date_field}) <= '{end_date}'"
     ]
@@ -336,83 +274,32 @@ def get_order_summary_metrics(start_date, end_date, drill_type, selected_value, 
 
     base_where = " AND ".join(base_conditions)
 
-    # Use separate Revenue and Cost Smart Strategies
-    # For canceled orders: only use crossdock leg revenue/cost
+    # Row-level allocation: each row's revenue/cost goes to that row's lane
     query = f"""
-    WITH order_metrics AS (
-        SELECT
-            orderCode,
-            MAX(CASE WHEN mainShipment = 'YES' THEN shipmentStatus END) as order_status,
-            -- Revenue metrics (for Complete orders only)
-            SUM(CASE WHEN mainShipment = 'YES' AND shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as yes_rev,
-            SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as no_rev,
-            SUM(CASE WHEN mainShipment = 'NO' AND pickLocationName = dropLocationName AND shipmentStatus = 'Complete'
-                THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as xd_leg_rev,
-            -- Cost metrics (for Complete orders only)
-            SUM(CASE WHEN mainShipment = 'YES' AND shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as yes_cost,
-            SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as no_cost,
-            SUM(CASE WHEN mainShipment = 'NO' AND pickLocationName = dropLocationName AND shipmentStatus = 'Complete'
-                THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as xd_no_cost,
-            -- Canceled order crossdock values
-            SUM(CASE WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName
-                THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as canceled_xd_rev,
-            SUM(CASE WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName
-                THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as canceled_xd_cost,
-            -- TONU metrics (Truck Order Not Used)
-            SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_revenue,
-            SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost,
-            -- Duplicate detection for cost
-            MAX(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete' AND ABS(
-                COALESCE(costAllocationNumber, 0) - (
-                    SELECT SUM(COALESCE(costAllocationNumber, 0))
-                    FROM otp_reports o2
-                    WHERE o2.orderCode = otp_reports.orderCode
-                      AND o2.mainShipment = 'YES'
-                      AND o2.shipmentStatus = 'Complete'
-                )
-            ) < 1 THEN 1 ELSE 0 END) as has_matching_no_row
-        FROM otp_reports
-        WHERE {base_where}
-        GROUP BY orderCode
-    ),
-    order_calculated AS (
-        SELECT
-            orderCode,
-            order_status,
-            -- Revenue: Smart Strategy for Complete, XD only for canceled
-            CASE
-                WHEN order_status = 'canceled' THEN canceled_xd_rev
-                WHEN yes_rev > 0 AND no_rev = 0 THEN yes_rev
-                WHEN yes_rev = 0 THEN no_rev
-                WHEN ABS((no_rev - xd_leg_rev) - yes_rev) < 1 THEN no_rev
-                WHEN yes_rev > 2 * no_rev THEN yes_rev + no_rev
-                ELSE no_rev
-            END as smart_revenue,
-            -- Cost: Smart Strategy for Complete, XD only for canceled
-            CASE
-                WHEN order_status = 'canceled' THEN canceled_xd_cost
-                WHEN yes_cost > 0 AND no_cost = 0 THEN yes_cost
-                WHEN yes_cost = 0 AND no_cost > 0 THEN no_cost
-                WHEN ABS((no_cost - xd_no_cost) - yes_cost) < 20 THEN
-                    CASE WHEN has_matching_no_row = 1 THEN yes_cost ELSE yes_cost + no_cost END
-                WHEN no_cost > yes_cost * 5 THEN yes_cost + no_cost
-                ELSE yes_cost + xd_no_cost
-            END as smart_cost,
-            CASE WHEN order_status = 'canceled' THEN canceled_xd_cost ELSE xd_no_cost END as crossdock_cost,
-            tonu_revenue,
-            tonu_cost
-        FROM order_metrics
-    )
     SELECT
-        COUNT(DISTINCT CASE WHEN order_status = 'Complete' THEN orderCode END) as completed_orders,
-        COUNT(DISTINCT CASE WHEN order_status = 'canceled' THEN orderCode END) as canceled_orders,
-        SUM(smart_revenue) as total_revenue,
-        SUM(smart_cost) as total_cost,
-        SUM(smart_revenue) - SUM(smart_cost) as total_profit,
-        SUM(crossdock_cost) as crossdock_cost,
-        SUM(tonu_revenue) as tonu_revenue,
-        SUM(tonu_cost) as tonu_cost
-    FROM order_calculated
+        COUNT(DISTINCT CASE WHEN shipmentStatus = 'Complete' THEN orderCode END) as completed_orders,
+        COUNT(DISTINCT CASE WHEN shipmentStatus = 'canceled' THEN orderCode END) as canceled_orders,
+        SUM(CASE
+            WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
+            WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
+            WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0)
+            ELSE 0
+        END) as total_revenue,
+        SUM(CASE
+            WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
+            WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
+            WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0)
+            ELSE 0
+        END) as total_cost,
+        SUM(CASE
+            WHEN pickLocationName = dropLocationName
+            THEN COALESCE(costAllocationNumber, 0)
+            ELSE 0
+        END) as crossdock_cost,
+        SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_revenue,
+        SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost
+    FROM otp_reports
+    WHERE {base_where}
     """
 
     return execute_query(query)
@@ -428,7 +315,7 @@ if selected_value:
             selected_lane,
             shipment_type
         )
-        # Get accurate summary metrics using Smart Strategies
+        # Get accurate summary metrics using Hybrid Approach
         summary_df = get_order_summary_metrics(
             start_date.strftime('%Y-%m-%d'),
             end_date.strftime('%Y-%m-%d'),
@@ -439,10 +326,10 @@ if selected_value:
         )
 
     if df is not None and len(df) > 0:
-        # Summary metrics using Smart Strategy calculations
+        # Summary metrics using Hybrid Approach calculations
         st.subheader(f"Summary for {drill_type}: {selected_value}")
 
-        # Extract summary values (use Smart Strategy totals, but row count from df)
+        # Extract summary values (use Hybrid Approach totals, but row count from df)
         if summary_df is not None and len(summary_df) > 0:
             completed_orders = int(summary_df['completed_orders'].iloc[0])
             canceled_orders = int(summary_df['canceled_orders'].iloc[0])

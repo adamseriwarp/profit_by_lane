@@ -102,19 +102,9 @@ def get_profit_by_lane_data(start_date, end_date, customers, lanes, shipment_typ
     """
 
     # Build base WHERE conditions
-    # Include: Complete orders + Canceled orders with crossdock legs
+    # Include: Complete orders + Canceled orders + TONU (regardless of status)
     base_conditions = [
-        """(
-            shipmentStatus = 'Complete'
-            OR (
-                shipmentStatus = 'canceled'
-                AND EXISTS (
-                    SELECT 1 FROM otp_reports o_xd
-                    WHERE o_xd.orderCode = otp_reports.orderCode
-                      AND o_xd.pickLocationName = o_xd.dropLocationName
-                )
-            )
-        )""",
+        "(shipmentStatus IN ('Complete', 'canceled') OR accessorialType = 'TONU')",
         "startMarket IS NOT NULL AND startMarket != ''",
         "endMarket IS NOT NULL AND endMarket != ''",
         f"({date_field}) >= '{start_date}'",
@@ -132,8 +122,8 @@ def get_profit_by_lane_data(start_date, end_date, customers, lanes, shipment_typ
     base_where = " AND ".join(base_conditions)
 
     if shipment_type == "Full Truckload":
-        # FTL: Use ALL rows (YES + NO) to capture cross-dock handling costs
-        # For canceled orders: only count crossdock leg revenue/cost
+        # FTL: Row-level allocation - each row's revenue/cost to that row's lane
+        # Includes TONU regardless of status, canceled orders only count crossdock
         query = f"""
         SELECT
             CONCAT(startMarket, ' → ', endMarket) as lane,
@@ -144,11 +134,13 @@ def get_profit_by_lane_data(start_date, end_date, customers, lanes, shipment_typ
             SUM(CASE
                 WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
                 WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
+                WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0)
                 ELSE 0
             END) as total_revenue,
             SUM(CASE
                 WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
                 WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
+                WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0)
                 ELSE 0
             END) as total_cost,
             SUM(CASE
@@ -164,91 +156,13 @@ def get_profit_by_lane_data(start_date, end_date, customers, lanes, shipment_typ
         GROUP BY startMarket, endMarket
         HAVING COUNT(DISTINCT CASE WHEN shipmentStatus = 'Complete' THEN orderCode END) > 0
             OR COUNT(DISTINCT CASE WHEN shipmentStatus = 'canceled' THEN orderCode END) > 0
-        ORDER BY (SUM(CASE WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
-                           WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END)
-                - SUM(CASE WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
-                           WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0) ELSE 0 END)) DESC
+            OR SUM(CASE WHEN accessorialType = 'TONU' THEN 1 ELSE 0 END) > 0
+        ORDER BY total_revenue - total_cost DESC
         """
 
     elif shipment_type == "Less Than Truckload":
-        # LTL: Validated Simple Approach (March 2026)
-        # Revenue: Hybrid (use legs when have allocation, else main)
-        # Cost: Sum ALL rows (YES + NO) - cost is additive
-        query = f"""
-        WITH order_metrics AS (
-            SELECT
-                orderCode,
-                -- Track order status
-                MAX(CASE WHEN mainShipment = 'YES' THEN shipmentStatus END) as order_status,
-                -- Revenue: Check if legs have allocation
-                SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete'
-                    THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as leg_revenue,
-                MAX(CASE WHEN mainShipment = 'YES' AND shipmentStatus = 'Complete'
-                    THEN CAST(REPLACE(REPLACE(total, '$', ''), ',', '') AS DECIMAL(15,2)) ELSE 0 END) as main_revenue,
-                -- Cost: Sum ALL rows (additive, not duplicated)
-                SUM(CASE WHEN shipmentStatus = 'Complete'
-                    THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as total_cost,
-                -- Crossdock cost tracking
-                SUM(CASE WHEN pickLocationName = dropLocationName AND shipmentStatus = 'Complete'
-                    THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as crossdock_cost,
-                -- Canceled order crossdock values
-                SUM(CASE WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName
-                    THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as canceled_xd_rev,
-                SUM(CASE WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName
-                    THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as canceled_xd_cost,
-                -- TONU metrics
-                SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_rev,
-                SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost,
-                -- Lane determination from YES row
-                COALESCE(MAX(CASE WHEN mainShipment = 'YES' THEN startMarket END), 'NA') as startMarket,
-                COALESCE(MAX(CASE WHEN mainShipment = 'YES' THEN endMarket END), 'NA') as endMarket
-            FROM otp_reports
-            WHERE {base_where}
-              AND shipmentType = 'Less Than Truckload'
-            GROUP BY orderCode
-        ),
-        order_calculated AS (
-            SELECT
-                orderCode,
-                order_status,
-                startMarket,
-                endMarket,
-                tonu_rev,
-                tonu_cost,
-                -- Revenue: Hybrid approach (legs when available, else main)
-                CASE
-                    WHEN order_status = 'canceled' THEN canceled_xd_rev
-                    WHEN leg_revenue > 0 THEN leg_revenue
-                    ELSE main_revenue
-                END as hybrid_revenue,
-                -- Cost: Sum ALL rows for Complete, XD only for canceled
-                CASE
-                    WHEN order_status = 'canceled' THEN canceled_xd_cost
-                    ELSE total_cost
-                END as hybrid_cost,
-                CASE WHEN order_status = 'canceled' THEN canceled_xd_cost ELSE crossdock_cost END as xd_cost
-            FROM order_metrics
-        )
-        SELECT
-            CONCAT(startMarket, ' → ', endMarket) as lane,
-            startMarket,
-            endMarket,
-            COUNT(DISTINCT CASE WHEN order_status = 'Complete' THEN orderCode END) as completed_orders,
-            COUNT(DISTINCT CASE WHEN order_status = 'canceled' THEN orderCode END) as canceled_orders,
-            SUM(hybrid_revenue) as total_revenue,
-            SUM(hybrid_cost) as total_cost,
-            SUM(hybrid_revenue) - SUM(hybrid_cost) as total_profit,
-            SUM(xd_cost) as crossdock_cost,
-            SUM(tonu_rev) as tonu_revenue,
-            SUM(tonu_cost) as tonu_cost
-        FROM order_calculated
-        GROUP BY startMarket, endMarket
-        ORDER BY total_profit DESC
-        """
-
-    elif shipment_type == "Parcel":
-        # Parcel: Use mainShipment = 'YES' rows only
-        # For canceled orders: only count crossdock leg revenue/cost
+        # LTL: Row-level allocation - each row's revenue/cost to that row's lane
+        # Includes TONU regardless of status, canceled orders only count crossdock
         query = f"""
         SELECT
             CONCAT(startMarket, ' → ', endMarket) as lane,
@@ -259,11 +173,52 @@ def get_profit_by_lane_data(start_date, end_date, customers, lanes, shipment_typ
             SUM(CASE
                 WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
                 WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
+                WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0)
                 ELSE 0
             END) as total_revenue,
             SUM(CASE
                 WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
                 WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
+                WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0)
+                ELSE 0
+            END) as total_cost,
+            SUM(CASE
+                WHEN pickLocationName = dropLocationName
+                THEN COALESCE(costAllocationNumber, 0)
+                ELSE 0
+            END) as crossdock_cost,
+            SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_revenue,
+            SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost
+        FROM otp_reports
+        WHERE {base_where}
+          AND shipmentType = 'Less Than Truckload'
+        GROUP BY startMarket, endMarket
+        HAVING COUNT(DISTINCT CASE WHEN shipmentStatus = 'Complete' THEN orderCode END) > 0
+            OR COUNT(DISTINCT CASE WHEN shipmentStatus = 'canceled' THEN orderCode END) > 0
+            OR SUM(CASE WHEN accessorialType = 'TONU' THEN 1 ELSE 0 END) > 0
+        ORDER BY total_revenue - total_cost DESC
+        """
+
+    elif shipment_type == "Parcel":
+        # Parcel: Row-level allocation - each row's revenue/cost to that row's lane
+        # Includes TONU regardless of status, canceled orders only count crossdock
+        query = f"""
+        SELECT
+            CONCAT(startMarket, ' → ', endMarket) as lane,
+            startMarket,
+            endMarket,
+            COUNT(DISTINCT CASE WHEN shipmentStatus = 'Complete' THEN orderCode END) as completed_orders,
+            COUNT(DISTINCT CASE WHEN shipmentStatus = 'canceled' THEN orderCode END) as canceled_orders,
+            SUM(CASE
+                WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
+                WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
+                WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0)
+                ELSE 0
+            END) as total_revenue,
+            SUM(CASE
+                WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
+                WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
+                WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0)
                 ELSE 0
             END) as total_cost,
             SUM(CASE
@@ -276,145 +231,49 @@ def get_profit_by_lane_data(start_date, end_date, customers, lanes, shipment_typ
         FROM otp_reports
         WHERE {base_where}
           AND shipmentType = 'Parcel'
-          AND mainShipment = 'YES'
         GROUP BY startMarket, endMarket
         HAVING COUNT(DISTINCT CASE WHEN shipmentStatus = 'Complete' THEN orderCode END) > 0
             OR COUNT(DISTINCT CASE WHEN shipmentStatus = 'canceled' THEN orderCode END) > 0
-        ORDER BY (SUM(CASE WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
-                           WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END)
-                - SUM(CASE WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
-                           WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0) ELSE 0 END)) DESC
+            OR SUM(CASE WHEN accessorialType = 'TONU' THEN 1 ELSE 0 END) > 0
+        ORDER BY total_revenue - total_cost DESC
         """
 
     else:
-        # All shipment types - combine FTL + LTL (validated simple approach) + Parcel
+        # All shipment types - Row-level allocation for all types
+        # Each row's revenue/cost goes to that row's lane
         query = f"""
-        WITH ltl_order_metrics AS (
-            SELECT
-                orderCode,
-                MAX(CASE WHEN mainShipment = 'YES' THEN shipmentStatus END) as order_status,
-                -- Revenue: Check if legs have allocation (hybrid approach)
-                SUM(CASE WHEN mainShipment = 'NO' AND shipmentStatus = 'Complete'
-                    THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as leg_revenue,
-                MAX(CASE WHEN mainShipment = 'YES' AND shipmentStatus = 'Complete'
-                    THEN CAST(REPLACE(REPLACE(total, '$', ''), ',', '') AS DECIMAL(15,2)) ELSE 0 END) as main_revenue,
-                -- Cost: Sum ALL rows (additive)
-                SUM(CASE WHEN shipmentStatus = 'Complete'
-                    THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as total_cost,
-                -- Crossdock cost tracking
-                SUM(CASE WHEN pickLocationName = dropLocationName AND shipmentStatus = 'Complete'
-                    THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as crossdock_cost,
-                -- Canceled order crossdock values
-                SUM(CASE WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName
-                    THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as canceled_xd_rev,
-                SUM(CASE WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName
-                    THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as canceled_xd_cost,
-                -- TONU metrics
-                SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_rev,
-                SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost,
-                COALESCE(MAX(CASE WHEN mainShipment = 'YES' THEN startMarket END), 'NA') as startMarket,
-                COALESCE(MAX(CASE WHEN mainShipment = 'YES' THEN endMarket END), 'NA') as endMarket
-            FROM otp_reports
-            WHERE {base_where}
-              AND shipmentType = 'Less Than Truckload'
-            GROUP BY orderCode
-        ),
-        ltl_order_calculated AS (
-            SELECT
-                orderCode,
-                order_status,
-                startMarket,
-                endMarket,
-                tonu_rev,
-                tonu_cost,
-                -- Revenue: Hybrid (legs when available, else main)
-                CASE
-                    WHEN order_status = 'canceled' THEN canceled_xd_rev
-                    WHEN leg_revenue > 0 THEN leg_revenue
-                    ELSE main_revenue
-                END as hybrid_revenue,
-                -- Cost: Sum ALL rows
-                CASE
-                    WHEN order_status = 'canceled' THEN canceled_xd_cost
-                    ELSE total_cost
-                END as hybrid_cost,
-                CASE WHEN order_status = 'canceled' THEN canceled_xd_cost ELSE crossdock_cost END as xd_cost
-            FROM ltl_order_metrics
-        ),
-        -- FTL: Sum ALL rows (same as validated cost approach)
-        ftl_orders AS (
-            SELECT
-                orderCode,
-                MAX(shipmentStatus) as order_status,
-                startMarket,
-                endMarket,
-                SUM(CASE
-                    WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
-                    WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
-                    ELSE 0
-                END) as hybrid_revenue,
-                SUM(CASE
-                    WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
-                    WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
-                    ELSE 0
-                END) as hybrid_cost,
-                SUM(CASE WHEN pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as xd_cost,
-                SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_rev,
-                SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost
-            FROM otp_reports
-            WHERE {base_where}
-              AND shipmentType = 'Full Truckload'
-            GROUP BY orderCode, startMarket, endMarket
-        ),
-        -- Parcel and others: mainShipment = 'YES' only
-        other_orders AS (
-            SELECT
-                orderCode,
-                shipmentStatus as order_status,
-                startMarket,
-                endMarket,
-                SUM(CASE
-                    WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
-                    WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
-                    ELSE 0
-                END) as hybrid_revenue,
-                SUM(CASE
-                    WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
-                    WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
-                    ELSE 0
-                END) as hybrid_cost,
-                SUM(CASE WHEN pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as xd_cost,
-                SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_rev,
-                SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost
-            FROM otp_reports
-            WHERE {base_where}
-              AND shipmentType NOT IN ('Full Truckload', 'Less Than Truckload')
-              AND mainShipment = 'YES'
-            GROUP BY orderCode, shipmentStatus, startMarket, endMarket
-        ),
-        all_orders AS (
-            SELECT orderCode, order_status, startMarket, endMarket, hybrid_revenue, hybrid_cost, xd_cost, tonu_rev, tonu_cost
-            FROM ltl_order_calculated
-            UNION ALL
-            SELECT orderCode, order_status, startMarket, endMarket, hybrid_revenue, hybrid_cost, xd_cost, tonu_rev, tonu_cost FROM ftl_orders
-            UNION ALL
-            SELECT orderCode, order_status, startMarket, endMarket, hybrid_revenue, hybrid_cost, xd_cost, tonu_rev, tonu_cost FROM other_orders
-        )
         SELECT
             CONCAT(startMarket, ' → ', endMarket) as lane,
             startMarket,
             endMarket,
-            COUNT(DISTINCT CASE WHEN order_status = 'Complete' THEN orderCode END) as completed_orders,
-            COUNT(DISTINCT CASE WHEN order_status = 'canceled' THEN orderCode END) as canceled_orders,
-            SUM(hybrid_revenue) as total_revenue,
-            SUM(hybrid_cost) as total_cost,
-            SUM(hybrid_revenue) - SUM(hybrid_cost) as total_profit,
-            SUM(xd_cost) as crossdock_cost,
-            SUM(tonu_rev) as tonu_revenue,
-            SUM(tonu_cost) as tonu_cost
-        FROM all_orders
+            COUNT(DISTINCT CASE WHEN shipmentStatus = 'Complete' THEN orderCode END) as completed_orders,
+            COUNT(DISTINCT CASE WHEN shipmentStatus = 'canceled' THEN orderCode END) as canceled_orders,
+            SUM(CASE
+                WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
+                WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
+                WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0)
+                ELSE 0
+            END) as total_revenue,
+            SUM(CASE
+                WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
+                WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
+                WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0)
+                ELSE 0
+            END) as total_cost,
+            SUM(CASE
+                WHEN pickLocationName = dropLocationName
+                THEN COALESCE(costAllocationNumber, 0)
+                ELSE 0
+            END) as crossdock_cost,
+            SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_revenue,
+            SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost
+        FROM otp_reports
+        WHERE {base_where}
         GROUP BY startMarket, endMarket
-        ORDER BY total_profit DESC
+        HAVING COUNT(DISTINCT CASE WHEN shipmentStatus = 'Complete' THEN orderCode END) > 0
+            OR COUNT(DISTINCT CASE WHEN shipmentStatus = 'canceled' THEN orderCode END) > 0
+            OR SUM(CASE WHEN accessorialType = 'TONU' THEN 1 ELSE 0 END) > 0
+        ORDER BY total_revenue - total_cost DESC
         """
 
     return execute_query(query)
