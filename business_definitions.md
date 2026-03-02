@@ -945,6 +945,171 @@ This ensures consistent lane attribution regardless of which rows are used for r
 
 ---
 
+### Hybrid Approach for Lane-Level Analysis ✅ (VALIDATED)
+
+**Purpose**: When analyzing profitability at the **lane level** (individual legs like Chicago → Dallas), use the `mainShipment = 'NO'` rows when they have allocation, otherwise fall back to the `mainShipment = 'YES'` row.
+
+**Context**: The CEO suggested using `revenueAllocationNumber` and `costAllocationNumber` on leg rows (`mainShipment = 'NO'`) to allocate revenue/cost to individual lanes. This was validated against 107,160 LTL Complete orders from 2025.
+
+#### Validation Results
+
+| Metric | Value |
+|--------|-------|
+| Total LTL Complete orders (2025) | 107,160 |
+| Main-only revenue | $31,538,112.86 |
+| Hybrid revenue | $31,299,393.63 |
+| **Difference** | **-$238,719 (-0.76%)** ✅ |
+
+#### How Orders Break Down
+
+| Category | Orders | % |
+|----------|--------|---|
+| **Use legs** (have allocation) | 61,219 | 55.7% |
+| **Use main** (no legs or no allocation) | 48,695 | 44.3% |
+
+#### Hybrid Logic
+
+```sql
+-- For each order, determine which source to use:
+CASE
+    WHEN leg_count > 0 AND sum_leg_allocation > 0 THEN 'USE_LEGS'
+    ELSE 'USE_MAIN'
+END
+```
+
+**When to use legs (`mainShipment = 'NO'`):**
+- Order has leg rows (`mainShipment = 'NO'`)
+- Legs have `revenueAllocationNumber > 0` (for revenue) or `costAllocationNumber > 0` (for cost)
+- Each leg represents a lane: `pickCity → dropCity`
+
+**When to fall back to main (`mainShipment = 'YES'`):**
+- Order has no leg rows
+- Legs exist but have $0 allocation (typically crossdock-only orders)
+- Lane = main row's `pickCity → dropCity` (entire route as one "lane")
+
+#### Why Some Orders Have No Leg Allocation
+
+**Key Finding**: 94.8% of orders where `main.total > 0` but `sum(leg.allocation) = 0` have **only crossdock legs**.
+
+A **crossdock leg** is identified by: `pickLocationName = dropLocationName`
+
+Crossdock legs are internal warehouse transfers, not real delivery legs, so they don't need revenue allocation. For these orders, fall back to the main row.
+
+#### The -0.76% Difference Explained
+
+- **20,829 orders** have leg allocation < main.total (under-allocated)
+- **3,239 orders** have leg allocation > main.total (over-allocated, possibly rebills/duplicates)
+- On net, slightly under-allocated, but <1% is acceptable
+
+#### Implementation Notes
+
+1. **For lane-level revenue dashboards**: Use the hybrid approach (legs when available, else main)
+2. **For order-level totals**: Continue using the Smart Strategy (Section above)
+3. **Lane granularity trade-off**: When falling back to main, the entire route becomes one "lane" (e.g., Chicago → Houston instead of Chicago → Dallas + Dallas → Houston)
+
+---
+
+### Lane Definition ✅ (VALIDATED)
+
+**Use `startMarket → endMarket` for lane-level analysis**, NOT `pickCity → dropCity`.
+
+#### Why Markets Instead of Cities
+
+| Field | Unique Lanes | Coverage |
+|-------|--------------|----------|
+| `pickCity → dropCity` | 39,118 | 99.9% |
+| `startMarket → endMarket` | **1,882** | 99.0% |
+
+**Markets are better because:**
+- Manageable number of lane combinations (1,882 vs 39,118)
+- Groups nearby cities into logical regions (e.g., "LAX" includes Los Angeles area)
+- More actionable for business decisions
+- Uses airport codes as region identifiers (LAX, EWR, SFO, ORD, etc.)
+
+#### Field Definitions
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `startMarket` | Origin market/region code | LAX, EWR, SFO |
+| `endMarket` | Destination market/region code | LAX, ORD, DFW |
+| `pickCity` | Origin city name | Los Angeles, Newark |
+| `dropCity` | Destination city name | San Francisco, Chicago |
+
+#### Lane Definition SQL
+
+```sql
+-- Lane = startMarket → endMarket
+SELECT
+    startMarket,
+    endMarket,
+    CONCAT(startMarket, ' → ', endMarket) as lane,
+    SUM(COALESCE(revenueAllocationNumber, 0)) as lane_revenue,
+    SUM(COALESCE(costAllocationNumber, 0)) as lane_cost,
+    SUM(COALESCE(revenueAllocationNumber, 0)) - SUM(COALESCE(costAllocationNumber, 0)) as lane_profit
+FROM otp_reports
+WHERE shipmentType = 'Less Than Truckload'
+  AND shipmentStatus = 'Complete'
+  AND startMarket IS NOT NULL AND startMarket != ''
+  AND endMarket IS NOT NULL AND endMarket != ''
+GROUP BY startMarket, endMarket
+ORDER BY lane_profit DESC
+```
+
+---
+
+### Cost Structure ⚠️ (DIFFERENT FROM REVENUE)
+
+**Critical Finding**: Cost works **completely differently** from revenue. Cost is **additive** across rows, NOT duplicated like revenue.
+
+#### Validation Results (vs Orders Table)
+
+| Approach | Cost Total | vs Orders Table |
+|----------|------------|-----------------|
+| **Orders table (truth)** | $29,109,644.89 | — |
+| Main rows only | $9,066,498.82 | **-68.9%** ❌ |
+| NO rows only | $20,496,903.40 | **-29.6%** ❌ |
+| **ALL rows (YES + NO)** | $29,563,482.22 | **+1.6%** ✅ |
+
+**Best Match**: Sum ALL rows (only $453,837 difference from orders table)
+
+#### Why Cost is Different from Revenue
+
+| Metric | Structure | Correct Approach |
+|--------|-----------|------------------|
+| **Revenue** | Main row has full amount, legs are a breakdown (duplicates) | Use **hybrid** (legs when available, else main) |
+| **Cost** | Main row has partial cost, legs have additional costs (additive) | **Sum ALL rows** (YES + NO) |
+
+**Why this makes sense:**
+- **Revenue** = One customer payment → duplicated on main row and split across legs
+- **Cost** = Multiple carrier payments → each leg has its own carrier cost that ADDS UP
+
+#### For Lane-Level Cost Analysis
+
+Since costs are additive (not duplicated), **sum `costAllocationNumber` from ALL rows** (`mainShipment = 'YES'` + `mainShipment = 'NO'`).
+
+For lane attribution:
+- Each `mainShipment = 'NO'` row = one lane with its `costAllocationNumber`
+- `mainShipment = 'YES'` row cost = attribute to the main lane (origin → destination)
+
+```sql
+-- Total cost for an order (should match orders.costAllocation)
+SELECT orderId, SUM(COALESCE(costAllocationNumber, 0)) as total_cost
+FROM otp_reports
+WHERE shipmentType = 'Less Than Truckload' AND shipmentStatus = 'Complete'
+GROUP BY orderId
+
+-- Lane-level cost breakdown (use startMarket/endMarket for lanes)
+SELECT startMarket, endMarket,
+       SUM(COALESCE(costAllocationNumber, 0)) as lane_cost
+FROM otp_reports
+WHERE shipmentType = 'Less Than Truckload' AND shipmentStatus = 'Complete'
+  AND startMarket IS NOT NULL AND startMarket != ''
+  AND endMarket IS NOT NULL AND endMarket != ''
+GROUP BY startMarket, endMarket
+```
+
+---
+
 ## OTP/OTD Definitions
 
 ### Standard Definition (DEFAULT)
