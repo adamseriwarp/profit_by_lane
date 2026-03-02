@@ -297,7 +297,18 @@ def get_order_summary_metrics(start_date, end_date, drill_type, selected_value, 
             ELSE 0
         END) as crossdock_cost,
         SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0) ELSE 0 END) as tonu_revenue,
-        SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost
+        SUM(CASE WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0) ELSE 0 END) as tonu_cost,
+        SUM(CASE
+            WHEN shipmentStatus = 'Complete' THEN COALESCE(revenueAllocationNumber, 0)
+            WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(revenueAllocationNumber, 0)
+            WHEN accessorialType = 'TONU' THEN COALESCE(revenueAllocationNumber, 0)
+            ELSE 0
+        END) - SUM(CASE
+            WHEN shipmentStatus = 'Complete' THEN COALESCE(costAllocationNumber, 0)
+            WHEN shipmentStatus = 'canceled' AND pickLocationName = dropLocationName THEN COALESCE(costAllocationNumber, 0)
+            WHEN accessorialType = 'TONU' THEN COALESCE(costAllocationNumber, 0)
+            ELSE 0
+        END) as total_profit
     FROM otp_reports
     WHERE {base_where}
     """

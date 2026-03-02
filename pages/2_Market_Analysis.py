@@ -142,6 +142,9 @@ df = get_market_data(
 )
 
 if df is not None and len(df) > 0:
+    # Calculate profit column
+    df['total_profit'] = df['total_revenue'] - df['total_cost']
+
     # Summary metrics
     total_revenue = df['total_revenue'].sum()
     total_cost = df['total_cost'].sum()
