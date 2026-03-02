@@ -290,7 +290,8 @@ with st.spinner("Loading data..."):
     )
 
 if df is not None and len(df) > 0:
-    # Calculate cross-dock cost percentage
+    # Calculate profit and percentages
+    df['total_profit'] = df['total_revenue'] - df['total_cost']
     df['crossdock_cost_pct'] = (df['crossdock_cost'] / df['total_cost'] * 100).fillna(0).round(1)
     df['margin_pct'] = (df['total_profit'] / df['total_revenue'] * 100).fillna(0).round(1)
 
