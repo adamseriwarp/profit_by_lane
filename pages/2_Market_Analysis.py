@@ -72,11 +72,12 @@ def get_market_data(start_date, end_date, excluded_customers, shipment_type, inc
     """
 
     # Include: Complete orders + Canceled orders + TONU (regardless of status)
+    # Same market filter for within-market analysis (startMarket = endMarket)
     base_conditions = [
         "(shipmentStatus IN ('Complete', 'canceled') OR accessorialType = 'TONU')",
         f"({DATE_FIELD}) >= '{start_date}'",
         f"({DATE_FIELD}) <= '{end_date}'",
-        "startMarket = endMarket",  -- Same market filter for within-market analysis
+        "startMarket = endMarket",
         "startMarket IS NOT NULL AND startMarket != ''"
     ]
 
