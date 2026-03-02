@@ -92,6 +92,7 @@ def get_zipcode_profitability(start_date, end_date, shipment_type, min_orders, s
     query = f"""
     SELECT
         lane, pickZipCode, dropZipCode, pickCity, dropCity,
+        startMarket, endMarket,
         completed_orders, canceled_orders, avg_miles,
         total_revenue, total_cost, crossdock_cost,
         (total_revenue - total_cost) as total_profit,
@@ -104,6 +105,8 @@ def get_zipcode_profitability(start_date, end_date, shipment_type, min_orders, s
             pickZipCode, dropZipCode,
             MAX(pickCity) as pickCity,
             MAX(dropCity) as dropCity,
+            MAX(startMarket) as startMarket,
+            MAX(endMarket) as endMarket,
             COUNT(DISTINCT CASE WHEN shipmentStatus = 'Complete' THEN orderCode END) as completed_orders,
             COUNT(DISTINCT CASE WHEN shipmentStatus = 'canceled' THEN orderCode END) as canceled_orders,
             ROUND(AVG(CASE WHEN mainShipment = 'YES' THEN COALESCE(shipmentMiles, 0) ELSE NULL END), 0) as avg_miles,
@@ -240,6 +243,8 @@ def get_lane_order_details(start_date, end_date, shipment_type, pick_zip, drop_z
         CAST(dropZipCode AS CHAR) as dropZipCode,
         CAST(pickCity AS CHAR) as pickCity,
         CAST(dropCity AS CHAR) as dropCity,
+        CAST(startMarket AS CHAR) as startMarket,
+        CAST(endMarket AS CHAR) as endMarket,
         CAST(dropWindowFrom AS CHAR) as scheduled_delivery,
         CAST(COALESCE(dropTimeArrived, dropDateArrived) AS CHAR) as actual_delivery,
         CAST(carrierName AS CHAR) as carrier,
@@ -343,12 +348,13 @@ if df is not None and len(df) > 0:
         display_df['total_profit'] = display_df['total_profit'].apply(lambda x: f"${x:,.0f}")
         display_df = display_df.rename(columns={
             'lane': 'Lane', 'pickCity': 'Origin City', 'dropCity': 'Dest City',
+            'startMarket': 'Start Market', 'endMarket': 'End Market',
             'completed_orders': 'Completed', 'canceled_orders': 'Canceled',
             'avg_miles': 'Avg Miles', 'total_revenue': 'Revenue', 'total_cost': 'Cost',
             'total_profit': 'Profit', 'margin_pct': 'Margin %', 'xd_cost_pct': 'XD Cost %'
         })
         st.dataframe(
-            display_df[['Lane', 'Origin City', 'Dest City', 'Completed', 'Canceled', 'Avg Miles', 'Revenue', 'Cost', 'Profit', 'Margin %', 'XD Cost %']],
+            display_df[['Lane', 'Origin City', 'Dest City', 'Start Market', 'End Market', 'Completed', 'Canceled', 'Avg Miles', 'Revenue', 'Cost', 'Profit', 'Margin %', 'XD Cost %']],
             use_container_width=True, height=400
         )
         st.download_button("📥 Download All Zipcode Lanes (CSV)", df.to_csv(index=False),
